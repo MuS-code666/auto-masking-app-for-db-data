@@ -353,8 +353,31 @@ def _migrate_to_v3(conn: sqlite3.Connection) -> None:
     _execute_script(conn, SCHEMA_V3)
 
 
+SCHEMA_V4 = """
+-- 画面の作業状態（設定の下書き等）。元の値を含み得るためプロジェクト内にだけ置く
+CREATE TABLE ui_state (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+-- 作業をまたいで引き継ぐ判断（「元データの誤りとして扱う」、同名の対象からの選択）。確定した作業の判断だけを記録する
+CREATE TABLE decision_memory (
+    item_key       TEXT PRIMARY KEY,
+    decision       TEXT NOT NULL,
+    created_run_id INTEGER REFERENCES run(id),
+    created_at     TEXT NOT NULL
+);
+"""
+
+
+def _migrate_to_v4(conn: sqlite3.Connection) -> None:
+    _execute_script(conn, SCHEMA_V4)
+
+
 # MIGRATIONS[i] は版 i から i+1 への移行
-MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [_migrate_to_v1, _migrate_to_v2, _migrate_to_v3]
+MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
+    _migrate_to_v1, _migrate_to_v2, _migrate_to_v3, _migrate_to_v4,
+]
 CURRENT_VERSION = len(MIGRATIONS)
 
 

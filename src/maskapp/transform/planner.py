@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from maskapp.config.model import Action, Config, ConfigError, Role, TemplateSpec
+from maskapp.config.model import Action, Config, ConfigError, OutsideAction, Role, TemplateSpec
 from maskapp.entity.codes import OutputRule
 from maskapp.entity.master import Master
 from maskapp.formats.csvfile import CsvDocument
@@ -90,10 +90,16 @@ class FilePlan:
     template: TemplateSpec
     grid: Grid
     changes: dict[tuple[int, int], Assignment] = field(default_factory=dict)
+    data_rows: list[int] = field(default_factory=list)  # データ行（合計行を除く設定ならそれを除く）
 
-    @property
-    def data_rows(self) -> range:
-        return range(self.template.header_row + 1, len(self.grid.rows))
+    def __post_init__(self) -> None:
+        if not self.data_rows:
+            self.data_rows = self.template.data_rows(self.grid.rows)
+        self._rows = set(self.data_rows)
+
+    def is_outside(self, r: int) -> bool:
+        """表外の行（見出しより上、または除いた合計行）。"""
+        return r < self.template.header_row or (r > self.template.header_row and r not in self._rows)
 
     def text_changes(self) -> dict[tuple[int, int], str]:
         return {k: a.value for k, a in self.changes.items() if a.value is not None}
@@ -303,7 +309,7 @@ def build_plan(
             if b.code_col is None:
                 continue
             values = observed.setdefault(b.scheme_id, [])
-            for r in range(template.header_row + 1, len(grid.rows)):
+            for r in template.data_rows(grid.rows):
                 value = grid.cell(r, b.code_col)
                 if value:
                     values.append(value)
@@ -355,6 +361,12 @@ def build_plan(
             for c in clear_cols:
                 if cell(c):
                     fp.changes[(r, c)] = Assignment("", "clear")
+        if template.outside_action is OutsideAction.CLEAR:
+            for r, values in enumerate(fp.grid.rows):
+                if fp.is_outside(r):
+                    for c, value in enumerate(values):
+                        if value:
+                            fp.changes[(r, c)] = Assignment("", "clear")
         files.append(fp)
 
     notes = [

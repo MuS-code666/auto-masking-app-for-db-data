@@ -172,6 +172,9 @@ erDiagram
 | run_sheet | run_id, source_file_id, sheet_idx, template_name（表の定義を適用するシート。CSV はシート 0。スキーマ v3） |
 | run_output | run_id, source_file_id, output_filename, output_path, sha256, size, published_at, staged_path, position |
 
+| ui_state | key, value（画面の作業状態。設定の下書き等。スキーマ v4） |
+| decision_memory | item_key, decision（作業をまたいで引き継ぐ判断。確定した作業の「元データの誤りとして扱う」「同名の対象からの選択」を記録し、次の作業の同じ項目に自動で適用する。スキーマ v4） |
+
 1つの xlsx の複数シートにそれぞれ別の表の定義を適用できる（例：製造原価シートと製品一覧シート）。どの定義も適用しないシートも出力に含まれ、残存検査の対象になる。
 
 出力ファイル自体には作業ID・対応表を埋め込まない（文書プロパティも初期化する）。追跡は project.db 側の sha256 で行う。

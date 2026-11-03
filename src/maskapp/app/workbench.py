@@ -137,6 +137,27 @@ class Workbench:
         _log.event("run_started", run_id=run_id)
         return run_id
 
+    def active_run(self) -> int | None:
+        """進行中の変換作業（同時に1つ）。"""
+        row = self.conn.execute(
+            f"SELECT id FROM run WHERE kind = 'convert' AND state IN ({','.join('?' * len(ACTIVE_STATES))}) "
+            "ORDER BY id DESC LIMIT 1",
+            [s.value for s in ACTIVE_STATES],
+        ).fetchone()
+        return row[0] if row else None
+
+    def current_step(self) -> int:
+        """画面の手順（2 取込・3 設定・4 確認・5 検証と出力）。作業の状態から決め、再開時に使う。"""
+        run_id = self.active_run()
+        if run_id is None:
+            return 2
+        state = self.state(run_id)
+        if state is RunState.DRAFT:
+            return 3 if self._inputs(run_id)[0] else 2
+        if state is RunState.PLANNED:
+            return 4
+        return 5
+
     def state(self, run_id: int) -> RunState:
         row = self.conn.execute("SELECT state FROM run WHERE id = ?", (run_id,)).fetchone()
         if row is None:
@@ -202,6 +223,81 @@ class Workbench:
             self._back_to_draft(conn, run_id)
         return assigned
 
+    def add_file(self, run_id: int, file_id: int) -> None:
+        """表の定義を適用せずにファイルを作業に加える（定義は画面で後から決める）。"""
+        self._require(run_id, RunState.DRAFT, RunState.PLANNED, RunState.STAGED, RunState.VERIFIED)
+        sha = self.conn.execute("SELECT sha256 FROM source_file WHERE id = ?", (file_id,)).fetchone()[0]
+        with self.project.transaction() as conn:
+            position = conn.execute(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM run_input WHERE run_id = ?", (run_id,)
+            ).fetchone()[0]
+            conn.execute(
+                "INSERT OR IGNORE INTO run_input (run_id, source_file_id, sha256, position) VALUES (?, ?, ?, ?)",
+                (run_id, file_id, sha, position),
+            )
+            self._back_to_draft(conn, run_id)
+
+    def assign_sheet(self, run_id: int, file_id: int, sheet: int, template_name: str | None) -> None:
+        """シートに適用する表の定義を決める（None で外す）。見出しとの一致は計画の作成時に確かめる。"""
+        self._require(run_id, RunState.DRAFT, RunState.PLANNED, RunState.STAGED, RunState.VERIFIED)
+        with self.project.transaction() as conn:
+            conn.execute("DELETE FROM run_sheet WHERE run_id = ? AND source_file_id = ? AND sheet_idx = ?",
+                         (run_id, file_id, sheet))
+            if template_name is not None:
+                conn.execute(
+                    "INSERT INTO run_sheet (run_id, source_file_id, sheet_idx, template_name) VALUES (?, ?, ?, ?)",
+                    (run_id, file_id, sheet, template_name),
+                )
+            self._back_to_draft(conn, run_id)
+
+    def back_to_draft(self, run_id: int) -> None:
+        """設定を見直すために作業を設定中に戻す（判断・確保した番号はそのまま）。"""
+        with self.project.transaction() as conn:
+            self._back_to_draft(conn, run_id)
+
+    def remove_input(self, run_id: int, file_id: int, sheet: int | None = None) -> None:
+        """作業からファイル（または xlsx の1シートの表の定義の適用）を外す。"""
+        self._require(run_id, RunState.DRAFT, RunState.PLANNED, RunState.STAGED, RunState.VERIFIED)
+        with self.project.transaction() as conn:
+            if sheet is None:
+                conn.execute("DELETE FROM run_sheet WHERE run_id = ? AND source_file_id = ?", (run_id, file_id))
+                conn.execute("DELETE FROM run_input WHERE run_id = ? AND source_file_id = ?", (run_id, file_id))
+            else:
+                conn.execute("DELETE FROM run_sheet WHERE run_id = ? AND source_file_id = ? AND sheet_idx = ?",
+                             (run_id, file_id, sheet))
+            self._back_to_draft(conn, run_id)
+
+    def run_files(self, run_id: int) -> list[RunFile]:
+        return self._inputs(run_id)[0]
+
+    def run_units(self, run_id: int) -> list[RunUnit]:
+        return self._inputs(run_id)[1]
+
+    def source(self, file_id: int) -> Source:
+        return load_source(self.project, file_id)
+
+    def file_info(self, file_id: int) -> dict:
+        """取込済みファイルの情報（元のファイル名を含む。画面表示用で、ログには出さない）。"""
+        name, fmt, info = self.conn.execute(
+            "SELECT original_filename, format, format_info FROM source_file WHERE id = ?", (file_id,)
+        ).fetchone()
+        sheets = [tuple(r) for r in self.conn.execute(
+            "SELECT idx, name, visibility FROM sheet WHERE source_file_id = ? ORDER BY idx", (file_id,))]
+        return {"id": file_id, "name": name, "format": fmt, "info": json.loads(info), "sheets": sheets}
+
+    def reset_inputs(self, run_id: int) -> None:
+        """設定を変えた後に、作業に含めたファイルの表の定義を照合し直す（見出しが合わなくなったシートは外す）。"""
+        files, units = self._inputs(run_id)
+        config = self.config()
+        with self.project.transaction() as conn:
+            for unit in units:
+                template = config.templates.get(unit.template_name)
+                rows = grid_of(load_source(self.project, unit.file_id), unit.sheet).rows
+                if template is None or match_template(Config(None, {template.name: template}), rows) is None:
+                    conn.execute("DELETE FROM run_sheet WHERE run_id = ? AND source_file_id = ? AND sheet_idx = ?",
+                                 (run_id, unit.file_id, unit.sheet))
+            self._back_to_draft(conn, run_id)
+
     @staticmethod
     def _sheet_index(source, sheet: int | str) -> int:
         if isinstance(sheet, int):
@@ -259,7 +355,14 @@ class Workbench:
             raise ConfigError("no configuration has been saved")
         conn.execute("UPDATE run SET config_version_id = ? WHERE id = ?", (config.version_id, run_id))
         files, units = self._inputs(run_id)
-        return build_plan(conn, run_id, config, files, units, self._sources(run_id))
+        sources = self._sources(run_id)
+        for unit in units:
+            template = config.templates.get(unit.template_name)
+            if template is None or match_template(
+                Config(None, {template.name: template}), grid_of(sources[unit.file_id], unit.sheet).rows
+            ) is None:
+                raise ConfigError("a sheet in this run does not match its table definition")
+        return build_plan(conn, run_id, config, files, units, sources)
 
     # ---------------------------------------------------------------- T1 計画
 
@@ -356,6 +459,17 @@ class Workbench:
             master.add_name(new_id, subject["name"], "primary", run_id)
             record["entity_id"] = new_id
         reviews.set_decision(conn, item.id, record)
+
+    def forget_decision(self, item_id: int) -> None:
+        """前回の作業から引き継いだ判断を取り消して、判断し直せるようにする。"""
+        item = reviews.get(self.conn, item_id)
+        run_id = self.conn.execute("SELECT run_id FROM review_item WHERE id = ?", (item_id,)).fetchone()[0]
+        self._require(run_id, RunState.PLANNED, RunState.STAGED, RunState.VERIFIED)
+        if not (item.decision and item.decision.get("remembered")):
+            raise ValueError("only decisions carried over from a previous run can be reopened")
+        with self.project.transaction() as conn:
+            reviews.forget(conn, item_id)
+            self._back_to_planned(conn, run_id)
 
     def _back_to_planned(self, conn, run_id: int) -> None:
         state = RunState(conn.execute("SELECT state FROM run WHERE id = ?", (run_id,)).fetchone()[0])
@@ -458,6 +572,7 @@ class Workbench:
         self.project.backup(reason="commit")
         with self.project.transaction() as conn:
             Master(conn).confirm_run(run_id)
+            reviews.remember_run(conn, run_id)
             revision = conn.execute("SELECT COALESCE(MAX(seq), 0) FROM master_event").fetchone()[0]
             conn.execute("UPDATE run SET master_rev_committed = ? WHERE id = ?", (revision, run_id))
             self._set_state(conn, run_id, RunState.COMMITTED)

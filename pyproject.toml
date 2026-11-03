@@ -34,3 +34,7 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# 画面の文言（日本語の案内文）は1行が長くなるため、行の長さの制限を外す
+"src/maskapp/ui/*" = ["E501"]

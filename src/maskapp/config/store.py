@@ -11,6 +11,7 @@ from maskapp.config.model import (
     ColumnSpec,
     Config,
     ConfigError,
+    OutsideAction,
     RelationSpec,
     Role,
     TemplateSpec,
@@ -66,7 +67,9 @@ def save_config(
         tid = conn.execute(
             "INSERT INTO table_template (config_version_id, display_name, header_signature, region_rule) "
             "VALUES (?, ?, ?, ?)",
-            (version, t.name, json.dumps(t.headers, ensure_ascii=False), json.dumps({"header_row": t.header_row})),
+            (version, t.name, json.dumps(t.headers, ensure_ascii=False),
+             json.dumps({"header_row": t.header_row, "skip_total_rows": t.skip_total_rows,
+                         "outside_action": t.outside_action.value})),
         ).lastrowid
         template_ids[t.name] = tid
         for pos, c in enumerate(t.columns):
@@ -116,7 +119,9 @@ def load_config(conn: sqlite3.Connection, version_id: int | None = None) -> Conf
                 (tid,),
             )
         ]
-        templates[name] = TemplateSpec(name, columns, json.loads(region_rule).get("header_row", 0))
+        rule = json.loads(region_rule)
+        templates[name] = TemplateSpec(name, columns, rule.get("header_row", 0), rule.get("skip_total_rows", False),
+                                       OutsideAction(rule.get("outside_action", "keep")))
         names_by_id[tid] = name
     relations = [
         RelationSpec(names_by_id[f], json.loads(fc)[0], names_by_id[t], json.loads(tc)[0])

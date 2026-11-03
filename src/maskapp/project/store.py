@@ -13,9 +13,13 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import sqlite3
+import stat
+import subprocess
+import sys
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -80,6 +84,42 @@ def validate_project_name(name: str) -> str:
     return stripped
 
 
+def protect_folder(root: Path) -> bool:
+    """フォルダを利用者本人だけが使えるアクセス権にする（継承を切り、本人に全権限）。設計書 07 章 6.3。
+
+    Windows 以外、または設定に失敗した場合は False を返す（画面で注意を表示する）。
+    """
+    if sys.platform != "win32":
+        return False
+    user = os.environ.get("USERNAME")
+    domain = os.environ.get("USERDOMAIN")
+    if not user:
+        return False
+    account = f"{domain}\\{user}" if domain else user
+    result = subprocess.run(
+        ["icacls", str(root), "/inheritance:r", "/grant:r", f"{account}:(OI)(CI)F"],
+        capture_output=True, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    return result.returncode == 0
+
+
+def delete_project_folder(root: Path) -> None:
+    """プロジェクトフォルダを削除する（閉じた状態で使う）。原本の読み取り専用属性を外してから消す。"""
+    root = Path(root)
+    if not (root / DB_NAME).is_file():
+        raise InvalidProjectError("not a project folder")
+    lock = ProjectLock(root / LOCK_NAME)
+    lock.acquire(timeout=DEFAULT_LOCK_TIMEOUT)
+    lock.release()
+
+    def _writable(func, path, _exc):
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+        func(path)
+
+    shutil.rmtree(root, onexc=_writable)
+    _log.event("project_deleted")
+
+
 def _connect(db_path: Path) -> sqlite3.Connection:
     # isolation_level=None: トランザクションは Project.transaction() で明示的に管理する
     conn = sqlite3.connect(db_path, isolation_level=None)
@@ -97,16 +137,19 @@ class Project:
         self._conn = conn
         self._lock = lock
         self._in_transaction = False
+        self.protected: bool | None = None  # 作成時にアクセス権を本人のみにできたか（開いた場合は None）
 
     # ---- 作成・開閉 ----
 
     @classmethod
-    def create(cls, parent: Path, name: str, color: str | None = None) -> Project:
+    def create(cls, parent: Path, name: str, color: str | None = None, protect: bool = True) -> Project:
         name = validate_project_name(name)
         root = Path(parent) / name
         if root.exists():
             raise ProjectExistsError("a folder with this project name already exists")
         root.mkdir(parents=True)
+        protected = protect_folder(root) if protect else False
+        _log.event("project_folder_protected", ok=protected)
         for sub in SUBDIRS:
             (root / sub).mkdir()
         lock = ProjectLock(root / LOCK_NAME)
@@ -124,6 +167,7 @@ class Project:
             raise
         _log.event("project_created", schema_version=schema.CURRENT_VERSION)
         project = cls(root, conn, lock)
+        project.protected = protected
         project._prepare_work_dir()
         return project
 
@@ -205,6 +249,10 @@ class Project:
         return self.conn.execute("SELECT name FROM project_info").fetchone()[0]
 
     @property
+    def color(self) -> str | None:
+        return self.conn.execute("SELECT color FROM project_info").fetchone()[0]
+
+    @property
     def schema_version(self) -> int:
         return schema.get_version(self.conn)
 
@@ -281,3 +329,24 @@ class Project:
             old.unlink()
         _log.event("backup_created", generations=min(len(backups), keep))
         return target
+
+    def backups(self) -> list[Path]:
+        return sorted(self.backup_dir.glob("project-*.db"), key=_backup_seq, reverse=True)
+
+    def restore_backup(self, backup: Path) -> Path:
+        """バックアップの内容で project.db を置き換える。直前の状態は先にバックアップする。
+
+        作業領域（work）は破棄する。戻したデータベースの作業の状態は、開き直したときの復旧で整える。
+        """
+        backup = Path(backup)
+        if backup.parent.resolve() != self.backup_dir.resolve() or not backup.is_file():
+            raise ValueError("backup must be one of this project's backups")
+        safety = self.backup(reason="before_restore")
+        src = sqlite3.connect(f"file:{backup.as_posix()}?mode=ro", uri=True)
+        try:
+            src.backup(self.conn)
+        finally:
+            src.close()
+        shutil.rmtree(self.work_dir / "runs", ignore_errors=True)
+        _log.event("backup_restored")
+        return safety

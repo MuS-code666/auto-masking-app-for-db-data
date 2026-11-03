@@ -178,7 +178,8 @@ def verify(conn: sqlite3.Connection, plan: Plan, staged: dict[int, tuple[str, by
                     for c, value in enumerate(row):
                         if (r, c) not in fp.changes and value:
                             residual.check(value, {"file_id": fp.file_id, "record": r, "column": c},
-                                           numeric_context=r > fp.template.header_row and c in numeric_cols)
+                                           numeric_context=not fp.is_outside(r) and r > fp.template.header_row
+                                           and c in numeric_cols)
         else:
             out_book = verify_book(plan, rf, source, data, findings, residual)
             if out_book is not None:

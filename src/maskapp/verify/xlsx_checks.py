@@ -242,7 +242,7 @@ def verify_book(plan: Plan, rf: RunFile, src: XlsxBook, data: bytes, findings: l
             location = {**loc, "sheet": sheet.idx, "row": r, "column": c}
             if cell.text and key not in bp.generated:
                 numeric = (cell.kind == "number" and fp is not None and c in keep_cols
-                           and r > fp.template.header_row)
+                           and r > fp.template.header_row and not fp.is_outside(r))
                 residual.check(cell.text, location, numeric_context=numeric)
             if cell.formula is not None and cell.formula.text and key not in bp.blocked_formulas:
                 residual.check(cell.formula.text, {**location, "part": "formula"})

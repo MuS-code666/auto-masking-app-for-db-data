@@ -35,6 +35,11 @@ ALLOWED: dict[ReviewKind, set[Decision]] = {
 }
 
 
+# 作業をまたいで引き継ぐ判断の種類。確定した作業の判断を記録し、次の作業で同じ項目に自動で適用する
+# （画面に「前回の判断」と表示し、利用者は取り消して判断し直せる）
+REMEMBERED = {ReviewKind.CODE_MULTI_NAME, ReviewKind.NAME_AMBIGUOUS}
+
+
 @dataclass(frozen=True)
 class ReviewItem:
     id: int
@@ -54,12 +59,14 @@ def upsert(
 ) -> ReviewItem:
     """同じ作業・同じキーの項目があればそれを返し、なければ作る。"""
     item_key = f"{kind.value}:{key}"
-    conn.execute(
+    created = conn.execute(
         "INSERT OR IGNORE INTO review_item (run_id, kind, location, subject, state, created_at, item_key) "
         "VALUES (?, ?, ?, ?, 'open', ?, ?)",
         (run_id, kind.value, json.dumps(location, ensure_ascii=False), json.dumps(subject, ensure_ascii=False),
          _now(), item_key),
-    )
+    ).rowcount
+    if created and kind in REMEMBERED:
+        _apply_memory(conn, run_id, item_key)
     row = conn.execute(
         "SELECT id, kind, subject, location, state, decision FROM review_item WHERE run_id = ? AND item_key = ?",
         (run_id, item_key),
@@ -98,3 +105,48 @@ def _row(row) -> ReviewItem:
         item_id, ReviewKind(kind), json.loads(subject), json.loads(location), state,
         json.loads(decision) if decision else None,
     )
+
+
+def _apply_memory(conn: sqlite3.Connection, run_id: int, item_key: str) -> None:
+    row = conn.execute("SELECT decision FROM decision_memory WHERE item_key = ?", (item_key,)).fetchone()
+    if row is None:
+        return
+    decision = json.loads(row[0])
+    entity_id = decision.get("entity_id")
+    if entity_id is not None:
+        status = conn.execute("SELECT status FROM entity WHERE id = ?", (entity_id,)).fetchone()
+        if status is None or status[0] not in ("draft", "confirmed"):
+            return  # 前回選んだ対象が取り消し・統合された場合は引き継がない
+    item_id = conn.execute(
+        "SELECT id FROM review_item WHERE run_id = ? AND item_key = ?", (run_id, item_key)
+    ).fetchone()[0]
+    set_decision(conn, item_id, {**decision, "remembered": True})
+
+
+def remember_run(conn: sqlite3.Connection, run_id: int) -> int:
+    """確定する作業の判断のうち、引き継ぐ種類のものを記録する。記録した件数を返す。"""
+    rows = []
+    for kind, item_key, decision in conn.execute(
+        "SELECT kind, item_key, decision FROM review_item WHERE run_id = ? AND state = 'decided'", (run_id,)
+    ).fetchall():
+        if ReviewKind(kind) not in REMEMBERED:
+            continue
+        d = json.loads(decision)
+        d.pop("remembered", None)
+        if ReviewKind(kind) is ReviewKind.NAME_AMBIGUOUS:
+            d = {"decision": Decision.LINK_EXISTING.value, "entity_id": d["entity_id"]}
+        elif d.get("decision") != Decision.KEEP_AS_SOURCE_ERROR.value:
+            continue  # 別名の登録は対応表に残るため記録不要
+        rows.append((item_key, json.dumps(d, ensure_ascii=False), run_id, _now()))
+    conn.executemany(
+        "INSERT OR REPLACE INTO decision_memory (item_key, decision, created_run_id, created_at) VALUES (?, ?, ?, ?)",
+        rows,
+    )
+    return len(rows)
+
+
+def forget(conn: sqlite3.Connection, item_id: int) -> None:
+    """引き継いだ判断を取り消し、項目を未確認に戻す（記録も消す）。"""
+    item_key = conn.execute("SELECT item_key FROM review_item WHERE id = ?", (item_id,)).fetchone()[0]
+    conn.execute("DELETE FROM decision_memory WHERE item_key = ?", (item_key,))
+    conn.execute("UPDATE review_item SET decision = NULL, state = 'open', decided_at = NULL WHERE id = ?", (item_id,))

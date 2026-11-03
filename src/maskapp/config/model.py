@@ -52,6 +52,21 @@ class ColumnSpec:
                 raise ConfigError(f"column '{self.header}': role is required for replace")
 
 
+class OutsideAction(StrEnum):
+    """表外の領域（見出しより上のタイトル・注記、合計行）の扱い。"""
+
+    KEEP = "keep"  # そのまま（残存検査の対象）
+    CLEAR = "clear"  # 内容を消す
+
+
+TOTAL_ROW_WORDS = frozenset({"合計", "総計", "小計", "計", "総合計", "total", "subtotal", "grandtotal"})
+
+
+def is_total_row(values: list[str]) -> bool:
+    """「合計」「計」等だけのセルを含む行（合計行らしい行）。"""
+    return any(normalize_header(v).casefold() in TOTAL_ROW_WORDS for v in values if v)
+
+
 @dataclass(frozen=True)
 class TemplateSpec:
     """表の定義。見出しの並び（columns の順）で取込ファイルと照合する。"""
@@ -59,6 +74,37 @@ class TemplateSpec:
     name: str
     columns: list[ColumnSpec]
     header_row: int = 0  # 見出し行（0 起点）。それより上は表外（タイトル・注記）
+    skip_total_rows: bool = False  # 合計行らしい行をデータに含めない（表外として扱う）
+    outside_action: OutsideAction = OutsideAction.KEEP
+
+    def data_rows(self, rows: list[list[str]]) -> list[int]:
+        """データ行の位置。合計行を除く設定なら、合計行らしい行を除く。"""
+        return [
+            r for r in range(self.header_row + 1, len(rows))
+            if not (self.skip_total_rows and is_total_row(rows[r]))
+        ]
+
+    def to_json(self) -> dict:
+        return {
+            "name": self.name, "header_row": self.header_row, "skip_total_rows": self.skip_total_rows,
+            "outside_action": self.outside_action.value,
+            "columns": [
+                {"header": c.header, "action": c.action.value, "info_type": c.info_type,
+                 "entity_type": c.entity_type, "role": c.role.value if c.role else None,
+                 "code_scheme": c.code_scheme, "binding": c.binding}
+                for c in self.columns
+            ],
+        }
+
+    @classmethod
+    def from_json(cls, data: dict) -> TemplateSpec:
+        columns = [
+            ColumnSpec(c["header"], Action(c["action"]), c.get("info_type"), c.get("entity_type"),
+                       Role(c["role"]) if c.get("role") else None, c.get("code_scheme"), c.get("binding"))
+            for c in data["columns"]
+        ]
+        return cls(data["name"], columns, data.get("header_row", 0), data.get("skip_total_rows", False),
+                   OutsideAction(data.get("outside_action", "keep")))
 
     @property
     def headers(self) -> list[str]:

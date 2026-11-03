@@ -32,6 +32,9 @@ py -3.12 -m venv .venv
 # テスト実行（試験プロセスでは外部通信が遮断される）
 .venv/Scripts/python -m pytest -q
 
+# アプリの起動（画面）
+.venv/Scripts/python -m maskapp
+
 # Excel での確認（手元に Excel がある場合のみ。出力を Excel で開き、再計算後の値を比べる）
 .venv/Scripts/python -m pytest -m excel
 
@@ -48,6 +51,7 @@ py -3.12 -m venv .venv
 - 業務データを扱うプロセスは起動直後に `maskapp.infra.netguard.install_network_guard()` を呼ぶ。
 - 一時ファイルは `Project.temp_dir`（プロジェクト内の work/tmp）に作る。%TEMP% は使わない。
 - 変換作業は `maskapp.app.Workbench` を通して行う（計画 → 書出し → 検証 → 確定 → 公開）。外部フォルダへの公開は対応表の確定後のみ。
+- 画面（`maskapp.ui`）は表示と操作の受付だけを持ち、処理は `maskapp.app.session.Session` を通す。画面の文言に「完全匿名化済み」「安全」等を使わない（試験で確認している）。元の値を表示する部品は「元の値を伏せる」（`ui.common.MASK`）に従う。
 - xlsx は `maskapp.formats.xlsx` で部品単位に扱う。openpyxl で開いて保存し直さない（openpyxl は検証の第二の読込器としてだけ使う）。新しい部品・機能に対応するときは、先に設計書 06 章の対応表を更新する。
 - project.db への書込は `Project.transaction()` の中で行う。スキーマ変更は `project/schema.py` の MIGRATIONS に追加し、既存の移行は変更しない。
 
