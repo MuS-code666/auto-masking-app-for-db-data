@@ -168,8 +168,11 @@ erDiagram
 ### run_input / run_output
 | テーブル | 主な列 |
 |---|---|
-| run_input | run_id, source_file_id, sha256 |
-| run_output | run_id, source_file_id, output_filename, output_path, sha256, size, published_at |
+| run_input | run_id, source_file_id, sha256, position（作業内の順序）, options（xlsx の扱いの選択：コメント除去・グラフ除去・画像の確認・数式の値への変換） |
+| run_sheet | run_id, source_file_id, sheet_idx, template_name（表の定義を適用するシート。CSV はシート 0。スキーマ v3） |
+| run_output | run_id, source_file_id, output_filename, output_path, sha256, size, published_at, staged_path, position |
+
+1つの xlsx の複数シートにそれぞれ別の表の定義を適用できる（例：製造原価シートと製品一覧シート）。どの定義も適用しないシートも出力に含まれ、残存検査の対象になる。
 
 出力ファイル自体には作業ID・対応表を埋め込まない（文書プロパティも初期化する）。追跡は project.db 側の sha256 で行う。
 

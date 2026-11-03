@@ -1,15 +1,16 @@
 """検証（設計書 07 章 1〜2）。作業領域に書き出したファイルを読み直して検査する。
 
 検査項目:
-  V1 構造（レコード数・各レコードのフィールド数・形式）
-  V2 維持した値（計画にないセルは元と完全一致）
+  V1 構造（CSV：レコード数・フィールド数・形式、xlsx：シートの数・名前・順序・セルの位置）
+  V2 維持した値（計画にないセルは元と完全一致。xlsx は型・書式・数式も）
   V3 集計（参考。Decimal で計算）
   V4 置換の一貫性（同じ対象→同じ値、異なる対象→異なる値、元の値が残っていない）
   V5 内容削除
   V6 関連（結合件数の比較。元からの未一致・重複は元データ由来として記録）
-  V7 元語句の残存
+  V7 元語句の残存（xlsx は全部品：セル・数式・シート名・名前定義・グラフ・コメント・プロパティ等）
   V8 未確認の要確認項目
   V9 出力ファイル名
+  V10 出力の健全性（xlsx：ZIP・XML・関係定義・内容種別、第二の読込器 openpyxl で同じ値が読めること）
 """
 
 from __future__ import annotations
@@ -24,12 +25,11 @@ from decimal import Decimal
 from maskapp.config.model import Action
 from maskapp.formats.csvfile import CsvDocument, CsvFormatError, read_csv
 from maskapp.transform import reviews
-from maskapp.transform.planner import FilePlan, Plan
+from maskapp.transform.planner import FilePlan, Grid, Plan
 from maskapp.transform.reviews import Decision, ReviewKind
-from maskapp.verify.residual import ResidualScanner, TermKind
+from maskapp.verify.residual import ResidualScanner, TermKind, dictionary_terms
 
 _NUMERIC = re.compile(r"^-?\d+(\.\d+)?$")
-_ACTIVE = "('draft', 'confirmed')"
 
 
 @dataclass(frozen=True)
@@ -74,91 +74,133 @@ def relation_stats(from_keys: list[str], to_keys: list[str]) -> dict[str, int]:
     }
 
 
-def _column_values(fp: FilePlan, doc: CsvDocument, col: int) -> list[str]:
-    out = []
-    for r in fp.data_rows:
-        record = doc.records[r]
-        if record.is_blank:
-            continue
-        out.append(record.fields[col].value if col < len(record.fields) else "")
-    return out
+def column_values(fp: FilePlan, grid: Grid, col: int) -> list[str]:
+    return [grid.cell(r, col) for r in fp.data_rows if r < len(grid.blank) and not grid.blank[r]]
 
 
-def _dictionary(conn: sqlite3.Connection) -> list[tuple[str, TermKind]]:
-    terms: list[tuple[str, TermKind]] = []
-    terms += [(r[0], TermKind.NAME) for r in conn.execute(
-        f"SELECT n.original_name FROM entity_name n JOIN entity e ON e.id = n.entity_id "
-        f"WHERE n.status IN {_ACTIVE} AND e.status IN {_ACTIVE}"
-    )]
-    terms += [(r[0], TermKind.CODE) for r in conn.execute(
-        f"SELECT original_code FROM entity_code WHERE status IN {_ACTIVE}"
-    )]
-    terms += [(r[0], TermKind.VALUE) for r in conn.execute(
-        f"SELECT original_value FROM value_token WHERE status IN {_ACTIVE}"
-    )]
-    return terms
+class ResidualCheck:
+    """元語句の残存の判定（V7）。短い語は要確認にし、人が「問題なし」とした箇所は除く。"""
+
+    def __init__(self, conn: sqlite3.Connection, run_id: int, findings: list[Finding]) -> None:
+        self.conn = conn
+        self.run_id = run_id
+        self.findings = findings
+        self.scanner = ResidualScanner(dictionary_terms(conn))
+
+    def check(self, text: str, location: dict, numeric_context: bool = False, kind: str = "residual") -> None:
+        for hit in self.scanner.scan(text):
+            if numeric_context and TermKind.CODE in hit.kinds:
+                self.findings.append(Finding("source", "info", "residual_numeric_match", location))
+            elif hit.short:
+                key = json.dumps(location, sort_keys=True, ensure_ascii=False) + ":" + hit.term
+                item = reviews.upsert(self.conn, self.run_id, ReviewKind.RESIDUAL_SHORT, key,
+                                      {"term": hit.term}, location)
+                if not (item.decision and item.decision.get("decision") == Decision.FALSE_POSITIVE):
+                    self.findings.append(Finding("transform", "block", "residual_short", location,
+                                                 {"review_id": item.id}))
+            else:
+                self.findings.append(Finding("transform", "block", kind, location))
+
+
+def _verify_csv(fp: FilePlan, src: CsvDocument, data: bytes, findings: list[Finding]) -> Grid | None:
+    loc = {"file_id": fp.file_id}
+    try:
+        out = read_csv(data, encoding=src.dialect.encoding, delimiter=src.dialect.delimiter)
+    except CsvFormatError:
+        findings.append(Finding("transform", "block", "output_unreadable", loc))
+        return None
+    # V1 構造
+    if out.dialect != src.dialect:
+        findings.append(Finding("transform", "block", "format_changed", loc))
+    if len(out.records) != len(src.records):
+        findings.append(Finding("transform", "block", "record_count_changed", loc,
+                                {"before": len(src.records), "after": len(out.records)}))
+        return None
+    width = len(fp.template.columns)
+    for r, (a, b) in enumerate(zip(src.records, out.records, strict=True)):
+        if len(a.fields) != len(b.fields):
+            findings.append(Finding("transform", "block", "field_count_changed", {**loc, "record": r}))
+        elif r >= fp.template.header_row and not a.is_blank and len(a.fields) != width:
+            findings.append(Finding("source", "info", "ragged_record", {**loc, "record": r},
+                                    {"fields": len(a.fields), "expected": width}))
+    # V2・V4・V5 セル単位
+    for r, (a, b) in enumerate(zip(src.records, out.records, strict=True)):
+        for c, (fa, fb) in enumerate(zip(a.fields, b.fields, strict=False)):
+            assignment = fp.changes.get((r, c))
+            cell = {**loc, "record": r, "column": c}
+            if assignment is None:
+                if fa.value != fb.value:
+                    findings.append(Finding("transform", "block", "kept_value_changed", cell))
+            elif assignment.value is None:
+                findings.append(Finding("transform", "block", "unresolved_cell", cell))
+            elif fb.value != assignment.value:
+                findings.append(Finding("transform", "block", "planned_value_mismatch", cell))
+            elif assignment.kind != "clear" and fa.value and fb.value == fa.value:
+                findings.append(Finding("transform", "block", "replace_not_applied", cell))
+    return Grid.of_csv(out)
+
+
+def _numeric_keep_columns(fp: FilePlan) -> set[int]:
+    cols = set()
+    for c, spec in enumerate(fp.template.columns):
+        if spec.action is Action.KEEP:
+            values = [v for v in column_values(fp, fp.grid, c) if v]
+            if values and all(_NUMERIC.match(v) for v in values):
+                cols.add(c)
+    return cols
 
 
 def verify(conn: sqlite3.Connection, plan: Plan, staged: dict[int, tuple[str, bytes]]) -> VerifyReport:
     """staged[file_id] = (出力ファイル名, 書き出したバイト列)。呼び出し側のトランザクション内で使う。"""
+    from maskapp.verify.xlsx_checks import verify_book
+
     findings: list[Finding] = []
     aggregates: list[dict] = []
-    out_docs: dict[int, CsvDocument] = {}
+    out_grids: dict[tuple[int, int], Grid] = {}
+    residual = ResidualCheck(conn, plan.run_id, findings)
 
     for note in plan.notes:
-        findings.append(Finding(note.origin, note.severity, note.kind, {}, note.detail))
+        location = {k: note.detail[k] for k in ("file_id",) if k in note.detail}
+        findings.append(Finding(note.origin, note.severity, note.kind, location, note.detail))
 
+    for rf in plan.run_files:
+        name, data = staged[rf.file_id]
+        source = plan.sources[rf.file_id]
+        units = plan.units_of(rf.file_id)
+        if isinstance(source, CsvDocument):
+            fp = units[0]
+            grid = _verify_csv(fp, source, data, findings)
+            if grid is not None:
+                out_grids[(fp.file_id, 0)] = grid
+                # V7（計画で作った値のセルは除く。生成した値には元の語句が含まれないため）
+                numeric_cols = _numeric_keep_columns(fp)
+                for r, row in enumerate(grid.rows):
+                    for c, value in enumerate(row):
+                        if (r, c) not in fp.changes and value:
+                            residual.check(value, {"file_id": fp.file_id, "record": r, "column": c},
+                                           numeric_context=r > fp.template.header_row and c in numeric_cols)
+        else:
+            out_book = verify_book(plan, rf, source, data, findings, residual)
+            if out_book is not None:
+                for fp in units:
+                    out_grids[(fp.file_id, fp.sheet)] = Grid.of_rows(out_book.sheet(fp.sheet).grid())
+        # V9 出力ファイル名
+        residual.check(name, {"file_id": rf.file_id, "part": "filename"}, kind="residual_filename")
+
+    # V3 集計（参考）
     for fp in plan.files:
-        name, data = staged[fp.file_id]
-        loc = {"file_id": fp.file_id}
-        src = fp.doc
-        try:
-            out = read_csv(data, encoding=src.dialect.encoding, delimiter=src.dialect.delimiter)
-        except CsvFormatError:
-            findings.append(Finding("transform", "block", "output_unreadable", loc))
+        out = out_grids.get((fp.file_id, fp.sheet))
+        if out is None:
             continue
-        out_docs[fp.file_id] = out
-        # V1 構造
-        if out.dialect != src.dialect:
-            findings.append(Finding("transform", "block", "format_changed", loc))
-        if len(out.records) != len(src.records):
-            findings.append(Finding("transform", "block", "record_count_changed", loc,
-                                    {"before": len(src.records), "after": len(out.records)}))
-            continue
-        width = len(fp.template.columns)
-        for r, (a, b) in enumerate(zip(src.records, out.records, strict=True)):
-            if len(a.fields) != len(b.fields):
-                findings.append(Finding("transform", "block", "field_count_changed", {**loc, "record": r}))
-            elif r >= fp.template.header_row and not a.is_blank and len(a.fields) != width:
-                findings.append(Finding("source", "info", "ragged_record", {**loc, "record": r},
-                                        {"fields": len(a.fields), "expected": width}))
-        # V2・V4・V5 セル単位
-        for r, (a, b) in enumerate(zip(src.records, out.records, strict=True)):
-            for c, (fa, fb) in enumerate(zip(a.fields, b.fields, strict=False)):
-                assignment = fp.changes.get((r, c))
-                cell = {**loc, "record": r, "column": c}
-                if assignment is None:
-                    if fa.value != fb.value:
-                        findings.append(Finding("transform", "block", "kept_value_changed", cell))
-                elif assignment.value is None:
-                    findings.append(Finding("transform", "block", "unresolved_cell", cell))
-                elif fb.value != assignment.value:
-                    findings.append(Finding("transform", "block", "planned_value_mismatch", cell))
-                elif assignment.kind != "clear" and fa.value and fb.value == fa.value:
-                    findings.append(Finding("transform", "block", "replace_not_applied", cell))
-        # V3 集計（参考）
-        for c, spec in enumerate(fp.template.columns):
-            if spec.action is not Action.KEEP:
-                continue
-            values = _column_values(fp, src, c)
-            nonblank = [v for v in values if v]
-            if nonblank and all(_NUMERIC.match(v) for v in nonblank):
-                out_values = [v for v in _column_values(fp, out, c) if v]
-                aggregates.append({
-                    "file_id": fp.file_id, "column": spec.header, "count": len(nonblank),
-                    "sum_before": str(sum(Decimal(v) for v in nonblank)),
-                    "sum_after": str(sum(Decimal(v) for v in out_values if _NUMERIC.match(v))),
-                })
+        for c in sorted(_numeric_keep_columns(fp)):
+            nonblank = [v for v in column_values(fp, fp.grid, c) if v]
+            out_values = [v for v in column_values(fp, out, c) if v]
+            aggregates.append({
+                "file_id": fp.file_id, "sheet": fp.sheet, "column": fp.template.columns[c].header,
+                "count": len(nonblank),
+                "sum_before": str(sum(Decimal(v) for v in nonblank)),
+                "sum_after": str(sum(Decimal(v) for v in out_values if _NUMERIC.match(v))),
+            })
 
     # V4 置換の一貫性（作業全体）
     code_out: dict[tuple[int, str], set[str]] = {}
@@ -167,13 +209,13 @@ def verify(conn: sqlite3.Connection, plan: Plan, staged: dict[int, tuple[str, by
     name_back: dict[tuple[str, str], set[str]] = {}
     entity_types: dict[str, str] = {}
     for fp in plan.files:
-        out = out_docs.get(fp.file_id)
-        if out is None or len(out.records) != len(fp.doc.records):
+        out = out_grids.get((fp.file_id, fp.sheet))
+        if out is None:
             continue
         for (r, c), a in fp.changes.items():
-            if a.value is None or c >= len(out.records[r].fields):
+            if a.value is None:
                 continue
-            original, produced = fp.doc.records[r].fields[c].value, out.records[r].fields[c].value
+            original, produced = fp.grid.cell(r, c), out.cell(r, c)
             if a.kind == "entity_code":
                 code_out.setdefault((a.scheme_id, original), set()).add(produced)
                 code_back.setdefault((a.scheme_id, produced), set()).add(original)
@@ -199,17 +241,17 @@ def verify(conn: sqlite3.Connection, plan: Plan, staged: dict[int, tuple[str, by
         if not from_files or not to_files:
             findings.append(Finding("environment", "info", "relation_not_checked", {}, detail))
             continue
-        if any(fp.file_id not in out_docs for fp in from_files + to_files):
+        if any((fp.file_id, fp.sheet) not in out_grids for fp in from_files + to_files):
             continue
         fc = from_files[0].template.index_of(rel.from_column)
         tc = to_files[0].template.index_of(rel.to_column)
         before = relation_stats(
-            [v for fp in from_files for v in _column_values(fp, fp.doc, fc)],
-            [v for fp in to_files for v in _column_values(fp, fp.doc, tc)],
+            [v for fp in from_files for v in column_values(fp, fp.grid, fc)],
+            [v for fp in to_files for v in column_values(fp, fp.grid, tc)],
         )
         after = relation_stats(
-            [v for fp in from_files for v in _column_values(fp, out_docs[fp.file_id], fc)],
-            [v for fp in to_files for v in _column_values(fp, out_docs[fp.file_id], tc)],
+            [v for fp in from_files for v in column_values(fp, out_grids[(fp.file_id, fp.sheet)], fc)],
+            [v for fp in to_files for v in column_values(fp, out_grids[(fp.file_id, fp.sheet)], tc)],
         )
         relations.append({**detail, "before": before, "after": after})
         if before != after:
@@ -221,42 +263,6 @@ def verify(conn: sqlite3.Connection, plan: Plan, staged: dict[int, tuple[str, by
         if before["duplicate_target_keys"]:
             findings.append(Finding("source", "info", "relation_duplicate_target", {},
                                     {**detail, "keys": before["duplicate_target_keys"]}))
-
-    # V7 元語句の残存（計画で作った値のセルは除く。生成した値には元の語句が含まれないため）
-    scanner = ResidualScanner(_dictionary(conn))
-    for fp in plan.files:
-        out = out_docs.get(fp.file_id)
-        if out is None:
-            continue
-        numeric_keep_cols = set()
-        for c, spec in enumerate(fp.template.columns):
-            if spec.action is Action.KEEP:
-                values = [v for v in _column_values(fp, fp.doc, c) if v]
-                if values and all(_NUMERIC.match(v) for v in values):
-                    numeric_keep_cols.add(c)
-        for r, record in enumerate(out.records):
-            in_data = r > fp.template.header_row
-            for c, f in enumerate(record.fields):
-                if (r, c) in fp.changes:
-                    continue
-                for hit in scanner.scan(f.value):
-                    cell = {"file_id": fp.file_id, "record": r, "column": c}
-                    if in_data and c in numeric_keep_cols and TermKind.CODE in hit.kinds:
-                        findings.append(Finding("source", "info", "residual_numeric_match", cell))
-                    elif hit.short:
-                        item = reviews.upsert(
-                            conn, plan.run_id, ReviewKind.RESIDUAL_SHORT,
-                            f"{fp.file_id}:{r}:{c}:{hit.term}", {"term": hit.term}, cell,
-                        )
-                        if not (item.decision and item.decision.get("decision") == Decision.FALSE_POSITIVE):
-                            findings.append(Finding("transform", "block", "residual_short", cell,
-                                                    {"review_id": item.id}))
-                    else:
-                        findings.append(Finding("transform", "block", "residual", cell))
-        # V9 出力ファイル名
-        name, _ = staged[fp.file_id]
-        if scanner.scan(name):
-            findings.append(Finding("transform", "block", "residual_filename", {"file_id": fp.file_id}))
 
     # V8 未確認
     open_items = len(reviews.list_items(conn, plan.run_id, state="open"))
@@ -271,6 +277,7 @@ def _store(conn: sqlite3.Connection, run_id: int, findings: list[Finding]) -> No
     conn.execute("DELETE FROM finding WHERE run_id = ?", (run_id,))
     conn.executemany(
         "INSERT INTO finding (run_id, origin, severity, kind, location, detail) VALUES (?, ?, ?, ?, ?, ?)",
-        [(run_id, f.origin, f.severity, f.kind, json.dumps(f.location), json.dumps(f.detail, ensure_ascii=False))
+        [(run_id, f.origin, f.severity, f.kind, json.dumps(f.location, ensure_ascii=False),
+          json.dumps(f.detail, ensure_ascii=False))
          for f in findings],
     )

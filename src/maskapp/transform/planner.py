@@ -4,8 +4,11 @@
 すべてこの計画を使う。新しい対象は計画の作成時に仮登録して番号を確保するため、
 プレビューで見えた番号がそのまま出力の番号になる。
 
+計画の単位は「表の定義を適用した表」（CSV は1ファイル、xlsx は1シート）。xlsx は表の単位の
+変更に加えて、ブック全体の変更（数式・キャッシュ値・部品の除去）を xlsx_plan で決める。
+
 決定性: 同じ入力・設定・対応表からは同じ計画を作る。新しい対象の番号は
-「作業内のファイル順 → 行順 → 列順」の初出順で確保する。
+「作業内のファイル順 → シート順 → 行順 → 列順」の初出順で確保する。
 """
 
 from __future__ import annotations
@@ -16,10 +19,13 @@ from maskapp.config.model import Action, Config, ConfigError, Role, TemplateSpec
 from maskapp.entity.codes import OutputRule
 from maskapp.entity.master import Master
 from maskapp.formats.csvfile import CsvDocument
+from maskapp.formats.xlsx.book import XlsxBook
 from maskapp.transform import reviews
 from maskapp.transform.reviews import ReviewKind
 
 CAPACITY_WARN_RATIO = 0.2
+
+Source = CsvDocument | XlsxBook
 
 
 @dataclass(frozen=True)
@@ -32,17 +38,62 @@ class Assignment:
     scheme_id: int | None = None
 
 
-@dataclass
-class FilePlan:
+@dataclass(frozen=True)
+class Grid:
+    """表の値（すべて文字列）。CSV はレコード、xlsx はシートのセル（照合用の文字列）。"""
+
+    rows: list[list[str]]
+    blank: list[bool]
+
+    @classmethod
+    def of_csv(cls, doc: CsvDocument) -> Grid:
+        return cls(doc.values(), [r.is_blank for r in doc.records])
+
+    @classmethod
+    def of_rows(cls, rows: list[list[str]]) -> Grid:
+        return cls(rows, [not any(r) for r in rows])
+
+    def cell(self, r: int, c: int | None) -> str:
+        if c is None or r >= len(self.rows):
+            return ""
+        row = self.rows[r]
+        return row[c] if c < len(row) else ""
+
+
+def grid_of(source: Source, sheet: int) -> Grid:
+    if isinstance(source, CsvDocument):
+        return Grid.of_csv(source)
+    return Grid.of_rows(source.sheet(sheet).grid())
+
+
+@dataclass(frozen=True)
+class RunFile:
     file_id: int
     position: int
+    options: dict = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RunUnit:
+    file_id: int
+    sheet: int
+    template_name: str
+
+
+@dataclass
+class FilePlan:
+    """1つの表（CSV ファイル、または xlsx の1シート）の変更。"""
+
+    file_id: int
+    sheet: int
+    position: int
     template: TemplateSpec
-    doc: CsvDocument
+    grid: Grid
     changes: dict[tuple[int, int], Assignment] = field(default_factory=dict)
 
     @property
     def data_rows(self) -> range:
-        return range(self.template.header_row + 1, len(self.doc.records))
+        return range(self.template.header_row + 1, len(self.grid.rows))
 
     def text_changes(self) -> dict[tuple[int, int], str]:
         return {k: a.value for k, a in self.changes.items() if a.value is not None}
@@ -64,12 +115,18 @@ class PlanNote:
 class Plan:
     run_id: int
     config: Config
-    files: list[FilePlan]
+    files: list[FilePlan]  # 表の単位
     notes: list[PlanNote]
+    run_files: list[RunFile] = field(default_factory=list)
+    sources: dict[int, Source] = field(default_factory=dict)
+    books: dict = field(default_factory=dict)  # file_id → xlsx_plan.BookPlan
 
     @property
     def unresolved(self) -> int:
         return sum(f.unresolved for f in self.files)
+
+    def units_of(self, file_id: int) -> list[FilePlan]:
+        return [f for f in self.files if f.file_id == file_id]
 
 
 @dataclass(frozen=True)
@@ -220,57 +277,59 @@ class _Resolver:
 
 
 def build_plan(
-    conn, run_id: int, config: Config, inputs: list[tuple[int, int, str]], docs: dict[int, CsvDocument]
+    conn, run_id: int, config: Config, run_files: list[RunFile], units: list[RunUnit], sources: dict[int, Source]
 ) -> Plan:
-    """inputs: (file_id, position, template_name) の一覧。呼び出し側のトランザクション内で使う。"""
+    """呼び出し側のトランザクション内で使う。"""
+    from maskapp.transform.xlsx_plan import plan_book
+
     resolver = _Resolver(conn, run_id)
-    ordered = sorted(inputs, key=lambda x: x[1])
+    file_order = {f.file_id: f.position for f in run_files}
+    ordered = sorted(units, key=lambda u: (file_order[u.file_id], u.sheet))
     layouts = {}
-    for _, _, tname in ordered:
-        template = config.template(tname)
+    for unit in ordered:
+        template = config.template(unit.template_name)
         for c in template.columns:
             if c.action is Action.FREETEXT:
                 raise ConfigError("free-text processing is not available yet (planned for phase 4)")
-        layouts[tname] = (template, _bindings(conn, template))
+        layouts[unit.template_name] = (template, _bindings(conn, template))
+    grids = {(u.file_id, u.sheet): grid_of(sources[u.file_id], u.sheet) for u in ordered}
 
     # 1. コード体系ごとの生成規則（未設定なら今回の観測コードから作る）
     observed: dict[int, list[str]] = {}
-    for file_id, _, tname in ordered:
-        template, bindings = layouts[tname]
-        doc = docs[file_id]
+    for unit in ordered:
+        template, bindings = layouts[unit.template_name]
+        grid = grids[(unit.file_id, unit.sheet)]
         for b in bindings:
             if b.code_col is None:
                 continue
             values = observed.setdefault(b.scheme_id, [])
-            for r in range(template.header_row + 1, len(doc.records)):
-                fields = doc.records[r].fields
-                if b.code_col < len(fields) and fields[b.code_col].value:
-                    values.append(fields[b.code_col].value)
+            for r in range(template.header_row + 1, len(grid.rows)):
+                value = grid.cell(r, b.code_col)
+                if value:
+                    values.append(value)
     for scheme_id, values in observed.items():
         resolver.rules[scheme_id] = resolver.master.output_rule(scheme_id, values)
 
     # 2. 行ごとの照合と割当て
     files: list[FilePlan] = []
-    for file_id, position, tname in ordered:
-        template, bindings = layouts[tname]
-        fp = FilePlan(file_id, position, template, docs[file_id])
+    for position, unit in enumerate(ordered):
+        template, bindings = layouts[unit.template_name]
+        fp = FilePlan(unit.file_id, unit.sheet, position, template, grids[(unit.file_id, unit.sheet)])
         value_cols = [
             (i, c.info_type) for i, c in enumerate(template.columns)
             if c.action is Action.REPLACE and c.role is Role.VALUE
         ]
         clear_cols = [i for i, c in enumerate(template.columns) if c.action is Action.CLEAR]
         for r in fp.data_rows:
-            record = fp.doc.records[r]
-            if record.is_blank:
+            if fp.grid.blank[r]:
                 continue
-            fields = record.fields
 
-            def cell(c: int | None, fields=fields) -> str:
-                return fields[c].value if c is not None and c < len(fields) else ""
+            def cell(c: int | None, r=r, grid=fp.grid) -> str:
+                return grid.cell(r, c)
 
             for b in bindings:
                 code, name = cell(b.code_col), cell(b.name_col)
-                location = {"file_id": file_id, "record": r}
+                location = {"file_id": unit.file_id, "sheet": unit.sheet, "record": r}
                 if code:
                     eid = resolver.by_code(b, code, name, location)
                 elif name:
@@ -307,4 +366,24 @@ def build_plan(
         if capacity and capacity - used < capacity * CAPACITY_WARN_RATIO:
             notes.append(PlanNote("transform", "warn", "code_capacity_low",
                                   {"scheme_id": scheme_id, "used": used, "capacity": capacity}))
-    return Plan(run_id, config, files, notes)
+    plan = Plan(run_id, config, files, notes, sorted(run_files, key=lambda f: f.position), dict(sources))
+
+    # 3. xlsx のブック全体の変更（対応表が出そろった後に、数式の文字列定数・キャッシュ値を決める）
+    for rf in plan.run_files:
+        source = sources[rf.file_id]
+        if isinstance(source, XlsxBook):
+            book_plan = plan_book(conn, plan, rf, source)
+            plan.books[rf.file_id] = book_plan
+            plan.notes.extend(book_plan.notes)
+    return plan
+
+
+def render_file(plan: Plan, file_id: int) -> bytes:
+    """計画どおりに変更した出力ファイルのバイト列。"""
+    source = plan.sources[file_id]
+    if isinstance(source, CsvDocument):
+        units = plan.units_of(file_id)
+        return source.serialize(units[0].text_changes() if units else {})
+    from maskapp.formats.xlsx.book import render
+
+    return render(source, plan.books[file_id].edits)

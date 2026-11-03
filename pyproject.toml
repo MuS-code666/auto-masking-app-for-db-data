@@ -9,12 +9,13 @@ description = "業務データ（Excel・CSV）の名称・コードをローカ
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "pyahocorasick>=2.1",  # 残存検査の多語句検索（BSD-3-Clause）
+    "lxml>=5",  # xlsx の部品（XML）の読み書き（BSD-3-Clause）
+    "openpyxl>=3.1",  # xlsx の出力の検証用の第二の読込器（MIT）。出力の作成には使わない
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
-    "openpyxl>=3.1",  # 合成データの xlsx 作成用（製品の出力処理には使わない）
     "ruff>=0.6",
 ]
 
@@ -24,6 +25,8 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src", "."]
+addopts = "-m 'not excel'"
+markers = ["excel: 手元の Excel で出力を開いて確かめる（-m excel で実行）"]
 
 [tool.ruff]
 line-length = 120

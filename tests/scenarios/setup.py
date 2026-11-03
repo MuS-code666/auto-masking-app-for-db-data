@@ -147,7 +147,25 @@ def run_through(wb: Workbench, run_id: int) -> tuple[VerifyReport, list[Path]]:
 def add_files(wb: Workbench, run_id: int, paths: list[Path]) -> list[int]:
     ids = []
     for path in paths:
-        file_id = wb.import_csv(path).id
+        file_id = wb.import_file(path).id
         wb.add_input(run_id, file_id)
         ids.append(file_id)
     return ids
+
+
+# 製造原価（xlsx・数式あり）と、同じブック内の製品一覧シート
+XLSX_TEMPLATES = [
+    TemplateSpec("製造原価", [
+        keep("製造番号"), keep("製造日"), code("製品CD", "PRODUCT", "製品コード"), name("製品名", "PRODUCT"),
+        code("原料CD", "MATERIAL", "原料コード"), name("原料名", "MATERIAL"), keep("使用量"), keep("原料単価"),
+        keep("原料費"), keep("労務費"), keep("経費"), keep("製造原価"), keep("生産数"), keep("単位原価"),
+        keep("工場"), keep("製造ライン"), code("担当者CD", "PERSON", "担当者コード"), name("担当者名", "PERSON"),
+        keep("取引年月"), clear("備考"),
+    ]),
+    TemplateSpec("製品一覧", [code("製品コード", "PRODUCT", "製品コード"), name("製品名", "PRODUCT")]),
+]
+XLSX_RELATIONS = [
+    RelationSpec("製造原価", "製品CD", "製品一覧", "製品コード"),
+    RelationSpec("製造原価", "原料CD", "原料マスタ", "原料コード"),
+    RelationSpec("製造原価", "担当者CD", "担当者マスタ", "担当者コード"),
+]

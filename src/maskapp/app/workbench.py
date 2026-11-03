@@ -29,11 +29,12 @@ from maskapp.config.model import ConfigError
 from maskapp.entity.master import Master
 from maskapp.formats.csvfile import CsvDocument
 from maskapp.infra.safelog import get_logger
-from maskapp.ingest import ImportedFile, import_csv, load_document
+from maskapp.ingest import ImportedFile, Source, import_csv, import_file, load_source
 from maskapp.project import Project
 from maskapp.transform import reviews
-from maskapp.transform.planner import Plan, build_plan
+from maskapp.transform.planner import Plan, RunFile, RunUnit, build_plan, grid_of, render_file
 from maskapp.transform.reviews import ALLOWED, Decision, ReviewItem, ReviewKind
+from maskapp.transform.xlsx_plan import BookOptions
 from maskapp.verify.checks import VerifyReport, verify
 
 _log = get_logger("workbench")
@@ -70,6 +71,7 @@ class PlanSummary:
     unresolved_cells: int
     open_reviews: int
     new_entities: int
+    blocking_notes: list[dict]  # 取込ファイル由来の停止条件（未対応の機能、コメント、数式の部分一致等）
 
 
 @dataclass(frozen=True)
@@ -104,6 +106,10 @@ class Workbench:
 
     def import_csv(self, path: Path, encoding: str | None = None, delimiter: str | None = None) -> ImportedFile:
         return import_csv(self.project, path, encoding=encoding, delimiter=delimiter)
+
+    def import_file(self, path: Path, encoding: str | None = None, delimiter: str | None = None) -> ImportedFile:
+        """拡張子で CSV・xlsx を判別して取り込む。"""
+        return import_file(self.project, path, encoding=encoding, delimiter=delimiter)
 
     def save_config(self, templates: list[TemplateSpec], relations: list[RelationSpec] = ()) -> int:
         with self.project.transaction() as conn:
@@ -146,43 +152,100 @@ class Workbench:
             raise RunStateError(f"run is {current.value}; expected one of {[s.value for s in states]}")
         return current
 
-    def add_input(self, run_id: int, file_id: int, template_name: str | None = None) -> str:
-        """作業にファイルを加える。表の定義は見出しで照合する（ファイル名は使わない）。"""
+    def add_input(self, run_id: int, file_id: int, template_name: str | None = None,
+                  sheet: int | str | None = None) -> dict[int, str]:
+        """作業にファイルを加え、表の定義を適用するシートを決める。{シート番号: 表の定義名} を返す。
+
+        表の定義は見出しで照合する（ファイル名は使わない）。xlsx でシートを指定しない場合は、
+        見出しが一致するすべてのシートに適用する。どのシートにも適用しないシートも出力に含まれ、
+        残存検査の対象になる。同じファイルに対して繰り返し呼べば、シートを追加できる。
+        """
         self._require(run_id, RunState.DRAFT, RunState.PLANNED, RunState.STAGED, RunState.VERIFIED)
         config = self.config()
-        doc = load_document(self.project, file_id)
-        values = doc.values()
-        if template_name is None:
-            template_name = match_template(config, values)
-            if template_name is None:
-                raise ConfigError("no table definition matches this file's headers")
+        source = load_source(self.project, file_id)
+        if isinstance(source, CsvDocument):
+            if sheet not in (None, 0):
+                raise ConfigError("a CSV file has only one table")
+            candidates = [0]
+        elif sheet is None:
+            candidates = [s.idx for s in source.sheets]
         else:
-            template = config.template(template_name)
-            if template.header_row >= len(values) or match_template(
-                Config(None, {template_name: template}), values
-            ) is None:
+            candidates = [self._sheet_index(source, sheet)]
+        scope = config if template_name is None else Config(None, {template_name: config.template(template_name)})
+        assigned: dict[int, str] = {}
+        for idx in candidates:
+            matched = match_template(scope, grid_of(source, idx).rows)
+            if matched is not None:
+                assigned[idx] = matched
+        if not assigned:
+            if template_name is not None:
                 raise ConfigError("file headers do not match the table definition")
+            raise ConfigError("no table definition matches this file's headers")
         sha = self.conn.execute("SELECT sha256 FROM source_file WHERE id = ?", (file_id,)).fetchone()[0]
         with self.project.transaction() as conn:
-            position = conn.execute(
-                "SELECT COALESCE(MAX(position), -1) + 1 FROM run_input WHERE run_id = ?", (run_id,)
-            ).fetchone()[0]
-            conn.execute(
-                "INSERT INTO run_input (run_id, source_file_id, sha256, template_name, position) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (run_id, file_id, sha, template_name, position),
+            exists = conn.execute(
+                "SELECT 1 FROM run_input WHERE run_id = ? AND source_file_id = ?", (run_id, file_id)
+            ).fetchone()
+            if not exists:
+                position = conn.execute(
+                    "SELECT COALESCE(MAX(position), -1) + 1 FROM run_input WHERE run_id = ?", (run_id,)
+                ).fetchone()[0]
+                conn.execute(
+                    "INSERT INTO run_input (run_id, source_file_id, sha256, position) VALUES (?, ?, ?, ?)",
+                    (run_id, file_id, sha, position),
+                )
+            conn.executemany(
+                "INSERT OR REPLACE INTO run_sheet (run_id, source_file_id, sheet_idx, template_name) "
+                "VALUES (?, ?, ?, ?)",
+                [(run_id, file_id, idx, name) for idx, name in assigned.items()],
             )
             self._back_to_draft(conn, run_id)
-        return template_name
+        return assigned
 
-    def _inputs(self, run_id: int) -> list[tuple[int, int, str]]:
-        return [tuple(r) for r in self.conn.execute(
-            "SELECT source_file_id, position, template_name FROM run_input WHERE run_id = ? ORDER BY position",
-            (run_id,),
-        )]
+    @staticmethod
+    def _sheet_index(source, sheet: int | str) -> int:
+        if isinstance(sheet, int):
+            if not 0 <= sheet < len(source.sheets):
+                raise ConfigError("sheet index out of range")
+            return sheet
+        for s in source.sheets:
+            if s.name == sheet:
+                return s.idx
+        raise ConfigError("sheet not found")
 
-    def _docs(self, run_id: int) -> dict[int, CsvDocument]:
-        return {fid: load_document(self.project, fid) for fid, _, _ in self._inputs(run_id)}
+    def set_options(self, run_id: int, file_id: int, options: BookOptions) -> None:
+        """xlsx の扱い（コメントの除去、画像の確認、数式の値への変換等）を選ぶ。"""
+        self._require(run_id, RunState.DRAFT, RunState.PLANNED, RunState.STAGED, RunState.VERIFIED)
+        with self.project.transaction() as conn:
+            updated = conn.execute(
+                "UPDATE run_input SET options = ? WHERE run_id = ? AND source_file_id = ?",
+                (json.dumps(options.to_json()), run_id, file_id),
+            ).rowcount
+            if not updated:
+                raise KeyError("file is not part of this run")
+            self._back_to_planned(conn, run_id)
+
+    def _inputs(self, run_id: int) -> tuple[list[RunFile], list[RunUnit]]:
+        files = [
+            RunFile(fid, pos, json.loads(options))
+            for fid, pos, options in self.conn.execute(
+                "SELECT source_file_id, position, options FROM run_input WHERE run_id = ? ORDER BY position",
+                (run_id,),
+            )
+        ]
+        units = [
+            RunUnit(fid, idx, name)
+            for fid, idx, name in self.conn.execute(
+                "SELECT source_file_id, sheet_idx, template_name FROM run_sheet WHERE run_id = ? "
+                "ORDER BY source_file_id, sheet_idx",
+                (run_id,),
+            )
+        ]
+        return files, units
+
+    def _sources(self, run_id: int) -> dict[int, Source]:
+        files, _ = self._inputs(run_id)
+        return {f.file_id: load_source(self.project, f.file_id) for f in files}
 
     def _back_to_draft(self, conn, run_id: int) -> None:
         state = RunState(conn.execute("SELECT state FROM run WHERE id = ?", (run_id,)).fetchone()[0])
@@ -195,13 +258,14 @@ class Workbench:
         if config.version_id is None:
             raise ConfigError("no configuration has been saved")
         conn.execute("UPDATE run SET config_version_id = ? WHERE id = ?", (config.version_id, run_id))
-        return build_plan(conn, run_id, config, self._inputs(run_id), self._docs(run_id))
+        files, units = self._inputs(run_id)
+        return build_plan(conn, run_id, config, files, units, self._sources(run_id))
 
     # ---------------------------------------------------------------- T1 計画
 
     def plan(self, run_id: int) -> PlanSummary:
         self._require(run_id, RunState.DRAFT, RunState.PLANNED)
-        if not self._inputs(run_id):
+        if not self._inputs(run_id)[0]:
             raise RunStateError("no input files in this run")
         with self.project.transaction() as conn:
             plan = self._build(conn, run_id)
@@ -214,25 +278,26 @@ class Workbench:
             new_entities=self.conn.execute(
                 "SELECT COUNT(*) FROM entity WHERE created_run_id = ? AND status = 'draft'", (run_id,)
             ).fetchone()[0],
+            blocking_notes=[{"kind": n.kind, **n.detail} for n in plan.notes if n.severity == "block"],
         )
         _log.event("run_planned", run_id=run_id, changed=summary.changed_cells,
                    unresolved=summary.unresolved_cells, reviews=summary.open_reviews)
         return summary
 
-    def preview(self, run_id: int, file_id: int, only_changed: bool = True) -> list[PreviewRow]:
+    def preview(self, run_id: int, file_id: int, only_changed: bool = True, sheet: int = 0) -> list[PreviewRow]:
         """変換前後の比較。計画（確保済みの番号）をそのまま使う。"""
         self._require(run_id, RunState.PLANNED, RunState.STAGED, RunState.VERIFIED, RunState.COMMITTED)
         with self.project.transaction() as conn:
             plan = self._build(conn, run_id)
-        fp = next(f for f in plan.files if f.file_id == file_id)
+        fp = next(f for f in plan.files if f.file_id == file_id and f.sheet == sheet)
         rows = []
-        for r in range(len(fp.doc.records)):
-            for c, f in enumerate(fp.doc.records[r].fields):
+        for r, values in enumerate(fp.grid.rows):
+            for c, value in enumerate(values):
                 a = fp.changes.get((r, c))
                 if a is None and only_changed:
                     continue
                 header = fp.template.columns[c].header if c < len(fp.template.columns) else ""
-                rows.append(PreviewRow(r, c, header, f.value, f.value if a is None else a.value))
+                rows.append(PreviewRow(r, c, header, value, value if a is None else a.value))
         return rows
 
     # ---------------------------------------------------------------- 要確認
@@ -308,11 +373,15 @@ class Workbench:
         shutil.rmtree(self._staging_dir(run_id), ignore_errors=True)
 
     def _default_names(self, plan: Plan) -> dict[int, str]:
+        """既定の出力ファイル名「{表の定義名}_{連番2桁}.{拡張子}」（元のファイル名は使わない）。"""
         counts: dict[str, int] = {}
         names = {}
-        for fp in plan.files:
-            counts[fp.template.name] = counts.get(fp.template.name, 0) + 1
-            names[fp.file_id] = f"{fp.template.name}_{counts[fp.template.name]:02d}.csv"
+        for rf in plan.run_files:
+            units = plan.units_of(rf.file_id)
+            base = units[0].template.name if units else "ファイル"
+            ext = "csv" if isinstance(plan.sources[rf.file_id], CsvDocument) else "xlsx"
+            counts[base] = counts.get(base, 0) + 1
+            names[rf.file_id] = f"{base}_{counts[base]:02d}.{ext}"
         return names
 
     def stage(self, run_id: int, output_names: dict[int, str] | None = None) -> list[Path]:
@@ -332,12 +401,12 @@ class Workbench:
         shutil.rmtree(staging, ignore_errors=True)
         staging.mkdir(parents=True)
         rows = []
-        for fp in plan.files:
-            data = fp.doc.serialize(fp.text_changes())
-            path = staging / names[fp.file_id]
+        for rf in plan.run_files:
+            data = render_file(plan, rf.file_id)
+            path = staging / names[rf.file_id]
             path.write_bytes(data)
-            rows.append((run_id, fp.file_id, names[fp.file_id], _sha256(data), len(data),
-                         str(path.relative_to(self.project.root)), fp.position))
+            rows.append((run_id, rf.file_id, names[rf.file_id], _sha256(data), len(data),
+                         str(path.relative_to(self.project.root)), rf.position))
         with self.project.transaction() as conn:
             conn.execute("DELETE FROM run_output WHERE run_id = ?", (run_id,))
             conn.executemany(
@@ -467,9 +536,9 @@ class Workbench:
         }
         staging = self._staging_dir(run_id)
         staging.mkdir(parents=True, exist_ok=True)
-        for fp in plan.files:
-            name, digest, staged_path = expected[fp.file_id]
-            data = fp.doc.serialize(fp.text_changes())
+        for rf in plan.run_files:
+            name, digest, staged_path = expected[rf.file_id]
+            data = render_file(plan, rf.file_id)
             if _sha256(data) != digest:
                 raise RunStateError("regenerated output differs from the committed output")
             (self.project.root / staged_path).write_bytes(data)

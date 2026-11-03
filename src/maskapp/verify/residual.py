@@ -68,3 +68,44 @@ class ResidualScanner:
                     continue
             hits.append(hit)
         return hits
+
+
+_ACTIVE = "('draft', 'confirmed')"
+
+
+def dictionary_terms(conn) -> list[tuple[str, TermKind]]:
+    """残存検査の辞書：有効な対象の元名称・別名、元コード、値対応の元値。"""
+    terms: list[tuple[str, TermKind]] = []
+    terms += [(r[0], TermKind.NAME) for r in conn.execute(
+        f"SELECT n.original_name FROM entity_name n JOIN entity e ON e.id = n.entity_id "
+        f"WHERE n.status IN {_ACTIVE} AND e.status IN {_ACTIVE}"
+    )]
+    terms += [(r[0], TermKind.CODE) for r in conn.execute(
+        f"SELECT original_code FROM entity_code WHERE status IN {_ACTIVE}"
+    )]
+    terms += [(r[0], TermKind.VALUE) for r in conn.execute(
+        f"SELECT original_value FROM value_token WHERE status IN {_ACTIVE}"
+    )]
+    return terms
+
+
+def replacement_map(conn) -> dict[str, set[str]]:
+    """元の語句 → 置換後の値の集合。値が1つなら語句だけから置換先が決まる（数式の文字列定数等で使う）。
+
+    同じ名称の別の対象（同名の別顧客、顧客と製品で同じ名称）があると値が複数になる。
+    """
+    out: dict[str, set[str]] = {}
+    for original, masked in conn.execute(
+        f"SELECT n.original_name, e.masked_name FROM entity_name n JOIN entity e ON e.id = n.entity_id "
+        f"WHERE n.status IN {_ACTIVE} AND e.status IN {_ACTIVE}"
+    ):
+        out.setdefault(original, set()).add(masked)
+    for original, masked in conn.execute(
+        f"SELECT original_code, masked_code FROM entity_code WHERE status IN {_ACTIVE}"
+    ):
+        out.setdefault(original, set()).add(masked)
+    for original, masked in conn.execute(
+        f"SELECT original_value, masked_value FROM value_token WHERE status IN {_ACTIVE}"
+    ):
+        out.setdefault(original, set()).add(masked)
+    return out

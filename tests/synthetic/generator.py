@@ -87,9 +87,15 @@ class Table:
 
 @dataclass(frozen=True)
 class Formula:
-    """xlsx の数式（"=" から始まる文字列）。キャッシュ値は持たない（段階2で対応予定）。"""
+    """xlsx の数式（"=" から始まる文字列）と、そのキャッシュ値（Excel が最後に計算した結果）。
+
+    shared=True の数式は、同じ列の連続するセルで Excel の共有数式として書き出す。
+    Excel は他のシートを参照する数式を共有数式にしない（そのようなファイルは Excel で開けない）。
+    """
 
     text: str
+    cached: Any = None
+    shared: bool = False
 
 
 @dataclass(frozen=True)
@@ -409,15 +415,22 @@ def _costs(g, ym, start, products, materials, persons) -> Table:
     for i in range(MONTHLY_ROWS):
         p, m, person = r.choice(products), r.choice(materials), r.choice(persons)
         excel_row = i + 2  # 見出しが1行目
+        used, price = Decimal(r.randint(10, 900)) / 10, m["price"]
+        material_cost = used * price
+        labor, overhead = Decimal(r.randint(5_000, 80_000)), Decimal(r.randint(1_000, 30_000))
+        total = material_cost + labor + overhead
+        units = r.randint(10, 1000)
         rows.append([
             f"M{ym}{i + 1:05d}", g.day(start, 28), p["code"],
-            Formula(f"=VLOOKUP(C{excel_row},製品一覧!A:B,2,FALSE)"),
-            m["code"], m["name"], Decimal(r.randint(10, 900)) / 10, m["price"],
-            Formula(f"=G{excel_row}*H{excel_row}"),
-            Decimal(r.randint(5_000, 80_000)), Decimal(r.randint(1_000, 30_000)),
-            Formula(f"=SUM(I{excel_row}:K{excel_row})"),
-            r.randint(10, 1000),
-            Formula(f"=ROUND(L{excel_row}/M{excel_row},2)"),
+            Formula(f"=VLOOKUP(C{excel_row},製品一覧!A:B,2,FALSE)", p["name"]),  # 他シート参照は共有数式にしない
+            m["code"], m["name"], used, price,
+            Formula(f"=G{excel_row}*H{excel_row}", material_cost, shared=True),
+            labor, overhead,
+            Formula(f"=SUM(I{excel_row}:K{excel_row})", total, shared=True),
+            units,
+            Formula(f"=ROUND(L{excel_row}/M{excel_row},2)", (total / units).quantize(Decimal("0.01"),
+                                                                                  rounding=ROUND_HALF_UP),
+                    shared=True),
             g.pick(_FACTORIES), f"L{r.randint(1, 4)}", person["code"].as_text(), person["name"], ym,
             _remark(g, None, person["name"]),
         ])
@@ -459,35 +472,10 @@ def to_csv_bytes(table: Table, encoding: str, newline: str, bom: bool = False) -
 
 
 def write_xlsx(path: Path, sheets: list[Table]) -> None:
-    from openpyxl import Workbook  # 開発用依存
+    from tests.synthetic.ooxml import BookSpec, SheetSpec, build_xlsx
 
-    wb = Workbook()
-    wb.remove(wb.active)
-    fixed = datetime(2026, 1, 1)
-    wb.properties.created = fixed
-    wb.properties.modified = fixed
-    wb.properties.creator = "synthetic"
-    for table in sheets:
-        ws = wb.create_sheet(table.sheet)
-        ws.append(table.headers)
-        for row in table.rows:
-            ws.append([_xlsx_value(v) for v in row])
-        for col_idx, v in enumerate(table.rows[0] if table.rows else [], start=1):
-            if isinstance(v, NumCode):
-                for cells in ws.iter_rows(min_row=2, min_col=col_idx, max_col=col_idx):
-                    cells[0].number_format = "0" * v.digits
-            elif isinstance(v, date):
-                for cells in ws.iter_rows(min_row=2, min_col=col_idx, max_col=col_idx):
-                    cells[0].number_format = "yyyy/mm/dd"
-    wb.save(path)
-
-
-def _xlsx_value(v: Any) -> Any:
-    if isinstance(v, NumCode):
-        return v.value
-    if isinstance(v, Formula):
-        return v.text
-    return v
+    book = BookSpec([SheetSpec(t.sheet, [list(t.headers)] + [list(r) for r in t.rows]) for t in sheets])
+    path.write_bytes(build_xlsx(book))
 
 
 def write_dataset(ds: Dataset, out_dir: Path) -> list[Path]:

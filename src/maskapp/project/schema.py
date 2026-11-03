@@ -333,8 +333,28 @@ def _migrate_to_v2(conn: sqlite3.Connection) -> None:
     _execute_script(conn, SCHEMA_V2)
 
 
+SCHEMA_V3 = """
+-- 作業に含めた xlsx の扱いの選択（コメントの除去、画像を検査しないことの確認など）
+ALTER TABLE run_input ADD COLUMN options TEXT NOT NULL DEFAULT '{}';
+-- 作業で表の定義を適用するシート（CSV はシート 0）。1つの xlsx の複数シートに別々の定義を適用できる
+CREATE TABLE run_sheet (
+    run_id         INTEGER NOT NULL REFERENCES run(id),
+    source_file_id INTEGER NOT NULL REFERENCES source_file(id),
+    sheet_idx      INTEGER NOT NULL,
+    template_name  TEXT NOT NULL,
+    PRIMARY KEY (run_id, source_file_id, sheet_idx)
+);
+INSERT INTO run_sheet (run_id, source_file_id, sheet_idx, template_name)
+    SELECT run_id, source_file_id, 0, template_name FROM run_input WHERE template_name IS NOT NULL;
+"""
+
+
+def _migrate_to_v3(conn: sqlite3.Connection) -> None:
+    _execute_script(conn, SCHEMA_V3)
+
+
 # MIGRATIONS[i] は版 i から i+1 への移行
-MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [_migrate_to_v1, _migrate_to_v2]
+MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [_migrate_to_v1, _migrate_to_v2, _migrate_to_v3]
 CURRENT_VERSION = len(MIGRATIONS)
 
 

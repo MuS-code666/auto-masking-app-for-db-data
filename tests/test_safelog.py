@@ -132,3 +132,36 @@ def test_full_flow_never_writes_synthetic_values(
 
     # 標準エラーにも値を出さない
     assert secret not in capsys.readouterr().err
+
+
+def test_xlsx_pipeline_logs_no_values(log_file: Path, tmp_path: Path, dataset, dataset_dir: Path):
+    """xlsx を含む一連の処理（取込・計画・書出し・検証・確定・公開、停止・取込失敗）でログに値が出ないこと。"""
+    from maskapp.app import Workbench
+    from maskapp.formats.xlsx.package import XlsxFormatError
+    from tests.scenarios.setup import RELATIONS, TEMPLATES, XLSX_RELATIONS, XLSX_TEMPLATES, add_files, run_through
+    from tests.synthetic.books import feature_book
+    from tests.synthetic.ooxml import build_xlsx
+
+    with Project.create(tmp_path, "ログ試験") as project:
+        wb = Workbench(project)
+        wb.save_config(TEMPLATES + XLSX_TEMPLATES, RELATIONS + XLSX_RELATIONS)
+        run = wb.start_run()
+        add_files(wb, run, [dataset_dir / "顧客マスタ.xlsx", dataset_dir / "製造原価_202604.xlsx"])
+        report, _ = run_through(wb, run)
+        assert report.ok
+        wb.commit(run)
+        wb.publish(run, tmp_path / "export")
+        bad = tmp_path / "壊れた.xlsx"
+        bad.write_bytes(b"PK\x03\x04" + dataset.truth["sensitive_values"][0].encode())
+        with pytest.raises(XlsxFormatError):
+            wb.import_file(bad)
+        pivot = tmp_path / "ピボット.xlsx"
+        pivot.write_bytes(build_xlsx(feature_book(dataset, "pivot")))
+        wb.import_file(pivot)
+
+    text = log_file.read_text(encoding="utf-8")
+    events = {e["event"] for e in _entries(log_file)}
+    assert {"xlsx_imported", "run_published"} <= events
+    forbidden = set(dataset.truth["sensitive_values"])
+    forbidden.update({"顧客マスタ", "製造原価", "製品一覧", "壊れた", "ピボット", "ログ試験"})
+    assert sorted(v for v in forbidden if v and v in text) == []
