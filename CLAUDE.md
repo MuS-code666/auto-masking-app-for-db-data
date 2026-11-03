@@ -44,6 +44,7 @@ py -3.12 -m venv .venv
 - ログは `maskapp.infra.safelog.get_logger()` の `event()` だけを使う。文字列（セル値・ファイル名・シート名・パス）は渡せない設計になっている。数値・真偽・列挙型・UUID のみ。
 - 業務データを扱うプロセスは起動直後に `maskapp.infra.netguard.install_network_guard()` を呼ぶ。
 - 一時ファイルは `Project.temp_dir`（プロジェクト内の work/tmp）に作る。%TEMP% は使わない。
+- 変換作業は `maskapp.app.Workbench` を通して行う（計画 → 書出し → 検証 → 確定 → 公開）。外部フォルダへの公開は対応表の確定後のみ。
 - project.db への書込は `Project.transaction()` の中で行う。スキーマ変更は `project/schema.py` の MIGRATIONS に追加し、既存の移行は変更しない。
 
 ## コーディング方針

@@ -124,7 +124,7 @@ def test_failed_migration_leaves_database_untouched(tmp_path: Path, monkeypatch:
         raise RuntimeError("migration failed")
 
     monkeypatch.setattr(schema, "MIGRATIONS", [schema.MIGRATIONS[0], broken])
-    monkeypatch.setattr(schema, "CURRENT_VERSION", 2)
+    monkeypatch.setattr(schema, "CURRENT_VERSION", 2)  # v1 の後に失敗する移行
     conn = sqlite3.connect(tmp_path / "m.db", isolation_level=None)
     with pytest.raises(RuntimeError):
         schema.migrate(conn)
@@ -144,6 +144,27 @@ def test_newer_schema_is_refused_and_lock_released(tmp_path: Path):
         Project.open(root)
     with pytest.raises(SchemaTooNewError):  # ロックが解放されていれば同じ理由で失敗する
         Project.open(root)
+
+
+def test_old_schema_is_migrated_with_backup(tmp_path: Path):
+    """v1 のプロジェクトを開くと、バックアップを取ってから最新版へ移行する。"""
+    root = tmp_path / "旧版"
+    root.mkdir()
+    conn = sqlite3.connect(root / "project.db", isolation_level=None)
+    conn.execute("BEGIN")
+    schema.MIGRATIONS[0](conn)
+    conn.execute("PRAGMA user_version = 1")
+    conn.execute(
+        "INSERT INTO project_info VALUES (1, 'u-1', '旧版', NULL, '2026-01-01', '0.0.0')"
+    )
+    conn.execute("COMMIT")
+    conn.close()
+    with Project.open(root) as p:
+        assert p.schema_version == schema.CURRENT_VERSION
+        assert p.uuid == "u-1"
+        assert len(list(p.backup_dir.glob("project-*-migrate.db"))) == 1
+        cols = [r[1] for r in p.conn.execute("PRAGMA table_info(column_rule)")]
+        assert "binding" in cols
 
 
 def test_corrupted_database_is_reported(tmp_path: Path):

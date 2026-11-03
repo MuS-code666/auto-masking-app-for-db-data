@@ -7,7 +7,9 @@ name = "maskapp"
 version = "0.0.1"
 description = "業務データ（Excel・CSV）の名称・コードをローカルで置換するアプリ"
 requires-python = ">=3.12,<3.13"
-dependencies = []
+dependencies = [
+    "pyahocorasick>=2.1",  # 残存検査の多語句検索（BSD-3-Clause）
+]
 
 [project.optional-dependencies]
 dev = [

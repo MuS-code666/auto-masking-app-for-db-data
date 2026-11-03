@@ -307,8 +307,34 @@ def _migrate_to_v1(conn: sqlite3.Connection) -> None:
     )
 
 
+SCHEMA_V2 = """
+-- 行内で組になる列（コード列と名称列）の識別
+ALTER TABLE column_rule ADD COLUMN binding TEXT;
+-- 作業に含めたファイルの順序と適用した表の定義名（定義名は設定版をまたいで同じ表を指す）
+ALTER TABLE run_input ADD COLUMN template_name TEXT;
+ALTER TABLE run_input ADD COLUMN position INTEGER NOT NULL DEFAULT 0;
+-- 取込時に検出した形式（CSV の文字コード・区切り等）と元の保存場所（上書き防止の判定用）
+ALTER TABLE source_file ADD COLUMN format_info TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE source_file ADD COLUMN original_dir TEXT;
+-- 仮登録をどの作業で作ったか（取消・確定の対象を特定する）
+ALTER TABLE entity_code ADD COLUMN created_run_id INTEGER REFERENCES run(id);
+ALTER TABLE entity_name ADD COLUMN created_run_id INTEGER REFERENCES run(id);
+ALTER TABLE value_token ADD COLUMN created_run_id INTEGER REFERENCES run(id);
+-- 要確認項目の重複防止
+ALTER TABLE review_item ADD COLUMN item_key TEXT;
+CREATE UNIQUE INDEX ux_review_item_key ON review_item (run_id, item_key);
+-- 作業領域に書き出したファイル
+ALTER TABLE run_output ADD COLUMN staged_path TEXT;
+ALTER TABLE run_output ADD COLUMN position INTEGER NOT NULL DEFAULT 0;
+"""
+
+
+def _migrate_to_v2(conn: sqlite3.Connection) -> None:
+    _execute_script(conn, SCHEMA_V2)
+
+
 # MIGRATIONS[i] は版 i から i+1 への移行
-MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [_migrate_to_v1]
+MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [_migrate_to_v1, _migrate_to_v2]
 CURRENT_VERSION = len(MIGRATIONS)
 
 
