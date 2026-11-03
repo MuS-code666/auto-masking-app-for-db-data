@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# 業務データ・プロジェクトデータを誤ってコミットしないための除外
+# （試験データは合成データ生成器で試験時に一時フォルダへ作る）
+*.xlsx
+*.xlsm
+*.xls
+*.csv
+*.tsv
+*.db
+*.db-wal
+*.db-shm
+*.lock
+projects/
+synthetic_out/
+.env

@@ -17,22 +17,34 @@
 - 保存: SQLite（プロジェクトごとに1ファイル）
 - xlsx: zipfile + lxml による部品単位の書き換え（openpyxl は検証用の読み直しのみ）
 - ローカルLLM: OpenVINO GenAI（第1候補）／llama.cpp（第2候補）。実機検証後に確定
-- テストフレームワーク: pytest（予定）
-
-開発コマンドは実装着手時に決めて追記する。
+- テスト・リント: pytest、ruff
 
 ## 開発コマンド
 
+Windows の Git Bash / PowerShell から実行する（Python 3.12）。
+
 ```bash
-# セットアップ
-# （未定）
+# セットアップ（初回）
+py -3.12 -m venv .venv
+.venv/Scripts/python -m pip install -r requirements-dev.txt
+.venv/Scripts/python -m pip install -e ".[dev]"
 
-# テスト実行
-# （未定）
+# テスト実行（試験プロセスでは外部通信が遮断される）
+.venv/Scripts/python -m pytest -q
 
-# リント / フォーマット
-# （未定）
+# リント
+.venv/Scripts/python -m ruff check src tests
+
+# 合成データの書き出し（出力先はリポジトリ外にする。*.csv / *.xlsx は .gitignore で除外済み）
+.venv/Scripts/python -m tests.synthetic <出力フォルダ>
 ```
+
+## 実装上の約束
+
+- ログは `maskapp.infra.safelog.get_logger()` の `event()` だけを使う。文字列（セル値・ファイル名・シート名・パス）は渡せない設計になっている。数値・真偽・列挙型・UUID のみ。
+- 業務データを扱うプロセスは起動直後に `maskapp.infra.netguard.install_network_guard()` を呼ぶ。
+- 一時ファイルは `Project.temp_dir`（プロジェクト内の work/tmp）に作る。%TEMP% は使わない。
+- project.db への書込は `Project.transaction()` の中で行う。スキーマ変更は `project/schema.py` の MIGRATIONS に追加し、既存の移行は変更しない。
 
 ## コーディング方針
 
