@@ -406,6 +406,20 @@ class Workbench:
                 rows.append(PreviewRow(r, c, header, value, value if a is None else a.value))
         return rows
 
+    def freetext_texts(self, run_id: int) -> list[str]:
+        """作業で「文章内の語句を置換」で処理する文章（異なる値、出現順）。AI の検査に使う。"""
+        self._require(run_id, RunState.PLANNED, RunState.STAGED, RunState.VERIFIED)
+        with self.project.transaction() as conn:
+            plan = self._build(conn, run_id)
+        texts = [fp.grid.cell(r, c) for fp in plan.files for (r, c) in fp.freetext]
+        return list(dict.fromkeys(t for t in texts if t.strip()))
+
+    def replan(self, run_id: int) -> PlanSummary:
+        """検証前の状態に戻して計画を作り直す（AI の検査結果を要確認に反映する等）。"""
+        with self.project.transaction() as conn:
+            self._back_to_planned(conn, run_id)
+        return self.plan(run_id)
+
     # ---------------------------------------------------------------- 要確認
 
     def reviews(self, run_id: int, state: str | None = "open") -> list[ReviewItem]:

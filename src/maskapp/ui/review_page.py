@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QSplitter,
     QTableView,
@@ -21,8 +22,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from maskapp.app.ai import prepare_scan, query_batches, save_batch
 from maskapp.app.session import Session
+from maskapp.llm import LLMClient
 from maskapp.transform.reviews import ALLOWED, Decision, ReviewItem, ReviewKind
+from maskapp.ui.ai_ui import require_settings, run_in_background
 from maskapp.ui.common import CHANGED_BG, CLEARED_BG, HEADER_BG, MASK, GridModel, run_safely
 from maskapp.ui.labels import CANDIDATE_PATTERNS, DECISIONS, REVIEW_KINDS, VALUE_TYPES
 
@@ -98,6 +102,10 @@ class ReviewPage(QWidget):
         bulk_values.setToolTip("規則で検出した電話番号・メール・郵便番号・URL を、値として登録して置換します")
         bulk_values.clicked.connect(self._register_values)
         actions.addStretch()
+        ai = QPushButton("AI で文章を検査…")
+        ai.setToolTip("「文章内の語句を置換」の文章を、この PC の中の AI で検査し、未登録の名称の候補を出します")
+        ai.clicked.connect(self.scan_with_ai)
+        actions.addWidget(ai)
         actions.addWidget(bulk_values)
         actions.addWidget(bulk)
         self.term_row = QWidget()
@@ -317,6 +325,44 @@ class ReviewPage(QWidget):
             run_safely(self, self.session.wb.decide_all, self.session.run_id, ReviewKind.NEW_ENTITY,
                        Decision.REGISTER_NEW)
             self._replan()
+
+    def scan_with_ai(self) -> None:
+        """AI で文章を検査し、候補を要確認に加える（問い合わせは別スレッド、保存はこの画面のスレッド）。"""
+        s = self.session
+        if not s or not s.run_id:
+            return
+        settings = require_settings(self)
+        if settings is None:
+            return
+        model = settings.model_name
+        prepared = run_safely(self, prepare_scan, s.wb, s.run_id, model)
+        if prepared is None:
+            return
+        items, summary = prepared
+        if not items:
+            QMessageBox.information(self, "AI", f"AI で検査する新しい文章はありません（検査済み {summary.already} 件）。")
+            return
+        client = LLMClient(settings)
+
+        def work(emit, should_stop):
+            for value in query_batches(client, items, should_stop):
+                emit(value)
+
+        def on_item(value) -> int:
+            batch, result = value
+            save_batch(s.wb, model, batch, result, summary)
+            return len(batch)
+
+        try:
+            _, error = run_in_background(self, f"AI で文章を検査しています（{len(items)} 件）", work, len(items), on_item)
+        finally:
+            client.stop()
+        self._replan()
+        rest = len(items) - summary.checked - summary.failed
+        text = f"AI で {summary.checked} 件の文章を検査しました（前に検査済み {summary.already} 件）。"
+        if summary.failed or rest or error:
+            text += f"\n検査できなかった文章 {summary.failed + rest} 件は、規則と辞書だけで検査します（⑤に件数を表示します）。"
+        QMessageBox.information(self, "AI", text)
 
     def _replan(self) -> None:
         """判断を反映して計画を作り直す（判断で新しい要確認が出ることがある）。"""

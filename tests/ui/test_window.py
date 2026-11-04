@@ -175,3 +175,32 @@ def test_screen_text_never_claims_anonymization():
     assert len(strings) > 200
     assert not [t for t in strings if "完全匿名化" in t or re.search(r"安全(です|に|な)", t)]
     assert "匿名化を保証するものではありません" in NOTICE
+
+
+def test_ai_buttons_with_test_worker(window, tmp_path, dataset_dir, monkeypatch):
+    """段階5：③の AI による列の推定と、④の AI による文章の検査（試験用のワーカー）。"""
+    from maskapp.llm import LLMSettings
+
+    LLMSettings(enabled=True, backend="fake", timeout_s=20).save()
+    monkeypatch.setenv("MASKAPP_FAKE_TERMS", "前回同様")
+    w = window
+    w.create_project("AI画面", tmp_path / "projects", None)
+    w.imports.add_paths([dataset_dir / "顧客マスタ.xlsx", dataset_dir / "売上明細_202604.csv"])
+    _define_tables(w)
+    w.go(3)
+    page = w.config
+    page.template_combo.setCurrentText("売上明細")
+    page.suggest_with_ai()
+    assert w.session.ai_columns["売上明細"]  # 試験用のワーカーはすべて「顧客名」と答える
+    assert page.columns.item(0, 6).text() != ""  # 規則の候補（伝票番号＝維持）と違う列に表示
+    page.columns.selectRow(0)
+    assert page.editor.use_ai.isEnabled()
+    for i in range(page.template_combo.count()):
+        page.template_combo.setCurrentIndex(i)
+        page._confirm_all()
+    w.confirm_config()
+    review = w.review
+    review.scan_with_ai()
+    assert any("AI で" in m and "件の文章を検査しました" in m for m in w.messages)
+    ai = [i for i in review.items if i.subject.get("pattern") == "ai"]
+    assert ai and ai[0].subject["text"] == "前回同様"

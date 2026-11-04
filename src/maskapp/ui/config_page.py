@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QListWidget,
+    QMessageBox,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -20,11 +21,18 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from maskapp.app.ai import suggest_columns_by_ai
 from maskapp.app.session import Session
 from maskapp.config import Action, ColumnSpec, RelationSpec, Role
 from maskapp.config.suggest import CODE_SCHEMES
+from maskapp.llm import LLMClient
+from maskapp.ui.ai_ui import require_settings, run_in_background
 from maskapp.ui.common import MASK, UNCONFIRMED_BG, highlight, run_safely
 from maskapp.ui.labels import ACTIONS, OUTSIDE, ROLES, VALUE_TYPES
+
+
+def _same_setting(a: ColumnSpec, b: ColumnSpec) -> bool:
+    return (a.action, a.role, a.entity_type, a.info_type) == (b.action, b.role, b.entity_type, b.info_type)
 
 
 def describe(spec: ColumnSpec, entity_names: dict[str, str]) -> tuple[str, str, str]:
@@ -65,6 +73,8 @@ class ColumnEditor(QGroupBox):
         self.binding.setEditable(True)
         self.binding.addItem("", None)
         self.save = QPushButton("この設定で確認済みにする")
+        self.use_ai = QPushButton("AI の推定を読み込む")
+        self.use_ai.setEnabled(False)
         form = QFormLayout(self)
         form.addRow("処理", self.action)
         form.addRow("種類", self.entity)
@@ -72,6 +82,7 @@ class ColumnEditor(QGroupBox):
         form.addRow("コード体系", self.scheme)
         form.addRow("その他の値の種類", self.value_type)
         form.addRow("組（同じ種類の列が複数の組）", self.binding)
+        form.addRow(self.use_ai)
         form.addRow(self.save)
         for w in (self.action, self.role):
             w.currentIndexChanged.connect(self._enable)
@@ -129,12 +140,17 @@ class ConfigPage(QWidget):
         self.region_label = QLabel()
         confirm_all = QPushButton("推定どおりで全列を確認済みにする")
         confirm_all.clicked.connect(self._confirm_all)
+        ai = QPushButton("AI で列の種類を推定…")
+        ai.setToolTip("列名と値の例（各列 5 件まで）を、この PC の中の AI に渡して推定します。設定は変えません")
+        ai.clicked.connect(self.suggest_with_ai)
         head = QHBoxLayout()
         head.addWidget(QLabel("表の定義"))
         head.addWidget(self.template_combo, 1)
+        head.addWidget(ai)
         head.addWidget(confirm_all)
-        self.columns = QTableWidget(0, 6)
-        self.columns.setHorizontalHeaderLabels(["列名", "サンプル（先頭の異なる値）", "処理", "種類", "詳細", "確認"])
+        self.columns = QTableWidget(0, 7)
+        self.columns.setHorizontalHeaderLabels(["列名", "サンプル（先頭の異なる値）", "処理", "種類", "詳細", "確認",
+                                                "AI の推定（違う場合）"])
         self.columns.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.columns.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         header = self.columns.horizontalHeader()
@@ -143,6 +159,7 @@ class ConfigPage(QWidget):
         self.columns.itemSelectionChanged.connect(self._column_selected)
         self.editor = ColumnEditor([])
         self.editor.save.clicked.connect(self._save_column)
+        self.editor.use_ai.clicked.connect(self._use_ai)
         tab_a = QWidget()
         la = QVBoxLayout(tab_a)
         la.addLayout(head)
@@ -251,12 +268,16 @@ class ConfigPage(QWidget):
             f"見出し行：{template.header_row + 1}行目　合計行：{'除く' if template.skip_total_rows else '含める'}　"
             f"表外：{OUTSIDE[template.outside_action.value]}（②で変更できます）")
         names = self._entity_names()
+        ai = s.ai_columns.get(name, {})
         self.columns.setRowCount(len(template.columns))
         for i, spec in enumerate(template.columns):
             action, kind, detail = describe(spec, names)
             sample = "、".join(MASK.show(v) for v in samples.get(spec.header, []))
             done = spec.header in confirmed
-            values = [spec.header, sample, action, kind, detail, "確認済み" if done else "未確認"]
+            suggestion = ai.get(spec.header)
+            ai_text = "" if suggestion is None or _same_setting(suggestion, spec) else \
+                "・".join(v for v in describe(suggestion, names)[:2] if v)
+            values = [spec.header, sample, action, kind, detail, "確認済み" if done else "未確認", ai_text]
             for j, v in enumerate(values):
                 item = QTableWidgetItem(v)
                 if not done:
@@ -276,6 +297,45 @@ class ConfigPage(QWidget):
         self.editor.binding.addItem("")
         self.editor.binding.addItems(bindings)
         self.editor.load(s.draft.templates[name].columns[row], schemes)
+        header = s.draft.templates[name].columns[row].header
+        self.editor.use_ai.setEnabled(header in s.ai_columns.get(name, {}))
+
+    def suggest_with_ai(self) -> None:
+        """AI で列の種類を推定し、規則の候補と違う列に表示する（設定は変えない）。"""
+        s = self.session
+        name = self.template_combo.currentText()
+        if not s or name not in s.draft.templates:
+            return
+        settings = require_settings(self)
+        if settings is None:
+            return
+        columns = s.ai_column_inputs(name)
+
+        def work(emit, should_stop):
+            with LLMClient(settings) as client:
+                return suggest_columns_by_ai(client, columns)
+
+        result, error = run_in_background(self, "AI で列の種類を推定しています", work)
+        if not result:
+            QMessageBox.information(self, "AI", "AI で推定できませんでした。規則による候補のまま確認してください。")
+            return
+        s.ai_columns[name] = result
+        self._load_columns()
+        columns = s.draft.templates[name].columns
+        differ = sum(1 for c in columns if c.header in result and not _same_setting(result[c.header], c))
+        QMessageBox.information(self, "AI", f"AI の推定が今の設定と違う列：{differ} 列（「AI の推定」の欄に表示します）。"
+                                "AI の推定は候補です。列を選んで「AI の推定を読み込む」で設定に反映できます。")
+
+    def _use_ai(self) -> None:
+        s = self.session
+        name = self.template_combo.currentText()
+        row = self.columns.currentRow()
+        if not s or row < 0:
+            return
+        header = s.draft.templates[name].columns[row].header
+        suggestion = s.ai_columns.get(name, {}).get(header)
+        if suggestion is not None:
+            self.editor.load(suggestion, [self.editor.scheme.itemText(i) for i in range(self.editor.scheme.count())])
 
     def _save_column(self) -> None:
         s = self.session

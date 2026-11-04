@@ -11,8 +11,9 @@
 - 短い語（2文字以下、数字のみ4桁以下）：人が「置換する／問題なし」を決める。判断は列（範囲）ごと
 - 置換先が複数ある語（顧客と製品で同じ名称、同名の別顧客）：同じ行の対象で1つに決まればそれを使い、
   決まらなければ人が置換先を選ぶ。判断は列（範囲）ごと
-- 規則で検出した候補（電話番号・メール・郵便番号・URL・法人格付きの語・敬称付きの語・担当者名らしい語）：
-  人が「対象・値として登録して置換／問題なし」を決める。判断は語句ごと（どの列でも同じ）
+- 規則で検出した候補（電話番号・メール・郵便番号・URL・法人格付きの語・敬称付きの語・担当者名らしい語）と、
+  AI（端末内の LLM）が検査済みの文章で示した候補：人が「対象・値として登録して置換／問題なし」を決める。
+  判断は語句ごと（どの列でも同じ）。AI の候補は、保存済みの検査結果から作る（計画の作成時に AI は動かさない）
 
 すべての判断は要確認項目（review_item）として記録し、確定した作業の判断は次の作業に引き継ぐ。
 """
@@ -27,6 +28,8 @@ from dataclasses import dataclass, field
 import ahocorasick
 
 from maskapp.entity.normalize import normalize_for_search
+from maskapp.llm.store import load_results, text_hash
+from maskapp.llm.tasks import NOT_HONORIFIC, TYPE_TO_ENTITY, AiCandidate
 from maskapp.transform import reviews
 from maskapp.transform.reviews import Decision, ReviewItem, ReviewKind
 from maskapp.verify.residual import is_short
@@ -174,9 +177,6 @@ _COMMON_BEFORE_HONORIFIC = {
     "お客", "客", "皆", "皆々", "各位", "先方", "担当者", "ご担当者", "ご担当", "担当", "貴社", "御社", "お得意",
     "得意先", "仕入先", "取引先", "顧客", "業者", "関係者", "お取引先", "ご依頼主", "依頼主",
 }
-# 「様」「殿」を含む一般的な語（敬称ではない）
-_NOT_HONORIFIC = ("同様", "仕様", "模様", "多様", "異様", "一様", "有様", "左様", "両様", "態様", "各様",
-                  "様々", "様子", "様式", "様相", "様態", "御殿", "宮殿", "神殿", "殿堂")
 _MAX_NAME = 20
 _PATTERNS: list[tuple[str, re.Pattern, dict]] = [
     ("email", re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)+"), {"info_type": "EMAIL"}),
@@ -213,7 +213,7 @@ def _run_backward(text: str, end: int, covered: list[bool], limit: int = _MAX_NA
 
 def _in_common_word(text: str, i: int, word: str) -> bool:
     """text[i:] の word が「同様」「仕様」等の一般的な語の一部か。"""
-    for common in _NOT_HONORIFIC:
+    for common in NOT_HONORIFIC:
         offset = common.find(word)
         if offset != -1 and i >= offset and text.startswith(common, i - offset):
             return True
@@ -291,6 +291,32 @@ class FreeTextPlanner:
     run_id: int
     _dictionary: Dictionary | None = None
     _items: dict[str, ReviewItem] = field(default_factory=dict)
+    _ai: dict[str, list[AiCandidate]] | None = None
+    ai_checked: set[str] = field(default_factory=set)  # AI で検査済みの文章（ハッシュ）
+    ai_unchecked: set[str] = field(default_factory=set)
+
+    @property
+    def ai_results(self) -> dict[str, list[AiCandidate]]:
+        if self._ai is None:
+            self._ai = load_results(self.conn) if self.conn is not None else {}
+        return self._ai
+
+    def _ai_candidates(self, text: str, covered: list[bool], found: list[Candidate]) -> list[Candidate]:
+        digest = text_hash(text)
+        if digest not in self.ai_results:
+            self.ai_unchecked.add(digest)
+            return found
+        self.ai_checked.add(digest)
+        out = list(found)
+        for ai in self.ai_results[digest]:
+            suggest = {"entity_type": TYPE_TO_ENTITY[ai.type]} if ai.type in TYPE_TO_ENTITY else {}
+            start = text.find(ai.text)
+            while start != -1:
+                end = start + len(ai.text)
+                if not any(covered[start:end]) and not any(start < c.end and c.start < end for c in out):
+                    out.append(Candidate(start, end, "ai", suggest))
+                start = text.find(ai.text, end)
+        return sorted(out, key=lambda c: c.start)
 
     @property
     def dictionary(self) -> Dictionary:
@@ -353,7 +379,7 @@ class FreeTextPlanner:
             if not m.term.short:
                 for i in range(m.start, m.end):
                     covered[i] = True
-        candidates = detect_candidates(text, covered)
+        candidates = self._ai_candidates(text, covered, detect_candidates(text, covered))
         # 候補（電話番号等）の中にある短い語は、候補として判断する
         matches = [m for m in matches if not (m.term.short and any(
             m.start < c.end and c.start < m.end for c in candidates))]

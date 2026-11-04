@@ -12,7 +12,7 @@ from pathlib import Path
 from maskapp.app.draft import ConfigDraft
 from maskapp.app.registry import Registry
 from maskapp.app.workbench import PlanSummary, RunState, Workbench
-from maskapp.config import Config, ConfigError, RelationSpec, TemplateSpec, match_template
+from maskapp.config import ColumnSpec, Config, ConfigError, RelationSpec, TemplateSpec, match_template
 from maskapp.config.suggest import (
     HeaderDiff,
     RelationCandidate,
@@ -106,6 +106,7 @@ class Session:
         self.wb = Workbench(project)
         self.draft = ConfigDraft.load(project)
         self._sources: dict[int, object] = {}
+        self.ai_columns: dict[str, dict[str, ColumnSpec]] = {}  # 表の定義 → 列名 → AI の推定（保存しない）
 
     # ---------------------------------------------------------------- 開閉
 
@@ -328,6 +329,11 @@ class Session:
                         break
             out[h] = seen
         return out
+
+    def ai_column_inputs(self, name: str) -> list[tuple[str, list[str]]]:
+        """AI に渡す列名と値の例（各列 5 件まで。tasks で 50 文字に切る）。"""
+        samples = self.samples(name)
+        return [(h, samples.get(h, [])) for h in self.draft.templates[name].headers]
 
     def update_column(self, name: str, index: int, spec) -> None:
         t = self.draft.templates[name]

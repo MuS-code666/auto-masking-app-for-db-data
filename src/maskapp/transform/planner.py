@@ -395,6 +395,11 @@ def build_plan(
             plan.notes.extend(book_plan.notes)
     if replaced:
         plan.notes.append(PlanNote("transform", "info", "freetext_replaced", {"count": replaced}))
+    if freetext.ai_checked or freetext.ai_unchecked:
+        # AI で検査していない文章の件数（検査の対象外として表示する）
+        unchecked = len(freetext.ai_unchecked)
+        plan.notes.append(PlanNote("environment", "info", "ai_not_checked" if unchecked else "ai_checked",
+                                   {"count": unchecked or len(freetext.ai_checked)}))
     return plan
 
 

@@ -11,9 +11,13 @@ dependencies = [
     "pyahocorasick>=2.1",  # 残存検査の多語句検索（BSD-3-Clause）
     "lxml>=5",  # xlsx の部品（XML）の読み書き（BSD-3-Clause）
     "openpyxl>=3.1",  # xlsx の出力の検証用の第二の読込器（MIT）。出力の作成には使わない
+    "PySide6-Essentials>=6.7",  # 画面（LGPL-3.0）
 ]
 
 [project.optional-dependencies]
+ai = [
+    "openvino-genai>=2026.4",  # 端末内の AI（LLM）の実行（Apache-2.0）。ワーカープロセスでだけ読み込む
+]
 dev = [
     "pytest>=8",
     "ruff>=0.6",
@@ -25,8 +29,11 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src", "."]
-addopts = "-m 'not excel'"
-markers = ["excel: 手元の Excel で出力を開いて確かめる（-m excel で実行）"]
+addopts = "-m 'not excel and not llm'"
+markers = [
+    "excel: 手元の Excel で出力を開いて確かめる（-m excel で実行）",
+    "llm: 手元の AI モデルで計測する（MASKAPP_TEST_MODEL にモデルのフォルダを指定し -m llm で実行）",
+]
 
 [tool.ruff]
 line-length = 120

@@ -91,6 +91,28 @@ def suggest_column(header: str, samples: Sequence[str] = ()) -> ColumnSpec:
     return ColumnSpec(header)
 
 
+# AI が答える列の種類（llm.tasks.COLUMN_TYPES）→ 列の設定
+_TYPE_ENTITY = {"顧客": "CUSTOMER", "製品": "PRODUCT", "原料": "MATERIAL", "仕入先": "SUPPLIER", "担当者": "PERSON"}
+_TYPE_VALUE = {"電話番号": "PHONE", "メール": "EMAIL", "郵便番号": "POSTAL"}
+
+
+def spec_from_type(header: str, type_label: str) -> ColumnSpec:
+    """AI が推定した列の種類から、列の設定の候補を作る（規則の候補と同じ考え方）。"""
+    if type_label in _TYPE_VALUE:
+        return ColumnSpec(header, Action.REPLACE, info_type=_TYPE_VALUE[type_label], role=Role.VALUE)
+    if type_label == "文章":
+        return ColumnSpec(header, Action.FREETEXT)
+    if type_label in ("住所", "カナ"):
+        return ColumnSpec(header, Action.CLEAR)
+    for word, etype in _TYPE_ENTITY.items():
+        if type_label == f"{word}コード":
+            return ColumnSpec(header, Action.REPLACE, entity_type=etype, role=Role.CODE,
+                              code_scheme=CODE_SCHEMES[etype])
+        if type_label == f"{word}名":
+            return ColumnSpec(header, Action.REPLACE, entity_type=etype, role=Role.NAME)
+    return ColumnSpec(header)
+
+
 def suggest_columns(headers: Sequence[str], samples: Sequence[Sequence[str]] = ()) -> list[ColumnSpec]:
     """列設定の候補。同じ種類のコード列が複数ある表（請求先・納品先 等）では、名称列を直前のコード列と組にする。"""
     specs = [suggest_column(h, samples[i] if i < len(samples) else ()) for i, h in enumerate(headers)]

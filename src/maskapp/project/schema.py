@@ -374,9 +374,26 @@ def _migrate_to_v4(conn: sqlite3.Connection) -> None:
     _execute_script(conn, SCHEMA_V4)
 
 
+SCHEMA_V5 = """
+-- AI（端末内の LLM）で文章を検査した結果。文章はハッシュで識別し、同じ文章は次の作業でも再利用する
+CREATE TABLE ai_text (
+    text_hash  TEXT NOT NULL,
+    model      TEXT NOT NULL,
+    status     TEXT NOT NULL CHECK (status IN ('ok', 'failed')),
+    candidates TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (text_hash, model)
+);
+"""
+
+
+def _migrate_to_v5(conn: sqlite3.Connection) -> None:
+    _execute_script(conn, SCHEMA_V5)
+
+
 # MIGRATIONS[i] は版 i から i+1 への移行
 MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
-    _migrate_to_v1, _migrate_to_v2, _migrate_to_v3, _migrate_to_v4,
+    _migrate_to_v1, _migrate_to_v2, _migrate_to_v3, _migrate_to_v4, _migrate_to_v5,
 ]
 CURRENT_VERSION = len(MIGRATIONS)
 

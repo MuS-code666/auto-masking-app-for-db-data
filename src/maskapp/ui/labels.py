@@ -26,6 +26,7 @@ REVIEW_KINDS = {
 CANDIDATE_PATTERNS = {
     "phone": "電話番号らしい語", "email": "メールアドレスらしい語", "postal": "郵便番号らしい語", "url": "URL",
     "company": "法人名らしい語", "honorific": "敬称（様・御中・殿）の付いた語", "person_label": "担当者名らしい語",
+    "ai": "AI が示した名称らしい語",
 }
 DECISIONS = {
     "register_new": "新しい対象として登録",
@@ -84,6 +85,8 @@ FINDINGS = {
     "formula_cache_replaced": "数式の計算結果を置換しました",
     "freetext_replaced": "文章内の語句を置換しました（セル数）",
     "part_text_replaced": "ヘッダー・フッター、グラフの文字を置換しました",
+    "ai_checked": "AI で文章を検査しました（候補は④で確認済み）",
+    "ai_not_checked": "AI で検査していない文章があります（規則と辞書だけで検査しました）",
     "recalculate_on_open": "Excel で開いたときに再計算する設定にしました（閉じるときに保存の確認が出ることがあります）",
     "rich_text_flattened": "書式付きの文字列を1つの書式にまとめました",
     "images_not_inspected": "画像の中身は検査していません",

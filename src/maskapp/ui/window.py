@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 from maskapp.app.registry import Registry
 from maskapp.app.session import Session
 from maskapp.app.workbench import RunState
+from maskapp.ui.ai_ui import AiSettingsDialog
 from maskapp.ui.common import MASK, run_safely
 from maskapp.ui.config_page import ConfigPage
 from maskapp.ui.import_page import ImportPage
@@ -114,6 +115,10 @@ class MainWindow(QMainWindow):
             action = QAction(text, self)
             action.triggered.connect(slot)
             menu.addAction(action)
+        ai_menu = self.menuBar().addMenu("AI")
+        ai_settings = QAction("AI の設定…", self)
+        ai_settings.triggered.connect(lambda: AiSettingsDialog(self).exec())
+        ai_menu.addAction(ai_settings)
         self.go(1)
 
     # ---------------------------------------------------------------- プロジェクト
