@@ -73,7 +73,11 @@ def test_first_month_flow_with_suggested_settings(tmp_path, dataset_dir, registr
     for c in candidates:
         session.add_relation(c.relation)
     summary = session.confirm_config()
-    assert summary.unresolved_cells == 0 and session.step() == 4
+    assert session.step() == 4
+    # 備考は「文章内を検査」の候補。規則で検出した電話番号・担当者名が要確認になり、判断までは未解決
+    patterns = {i.subject.get("pattern") for i in session.wb.reviews(session.run_id)
+                if i.kind is ReviewKind.FREETEXT_CANDIDATE}
+    assert {"phone", "person_label"} <= patterns and summary.unresolved_cells > 0
 
     outputs = _publish(session, tmp_path / "export")
     assert len(outputs) == 7

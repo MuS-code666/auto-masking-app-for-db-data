@@ -87,8 +87,12 @@ class ResidualCheck:
         self.findings = findings
         self.scanner = ResidualScanner(dictionary_terms(conn))
 
-    def check(self, text: str, location: dict, numeric_context: bool = False, kind: str = "residual") -> None:
+    def check(self, text: str, location: dict, numeric_context: bool = False, kind: str = "residual",
+              ignore_short: bool = False) -> None:
+        """ignore_short: 文章内を検査した部分。短い語は計画の作成時に判断済みのため除く。"""
         for hit in self.scanner.scan(text):
+            if ignore_short and hit.short:
+                continue
             if numeric_context and TermKind.CODE in hit.kinds:
                 self.findings.append(Finding("source", "info", "residual_numeric_match", location))
             elif hit.short:
@@ -176,7 +180,11 @@ def verify(conn: sqlite3.Connection, plan: Plan, staged: dict[int, tuple[str, by
                 numeric_cols = _numeric_keep_columns(fp)
                 for r, row in enumerate(grid.rows):
                     for c, value in enumerate(row):
-                        if (r, c) not in fp.changes and value:
+                        if (r, c) in fp.freetext:
+                            for part in fp.freetext[(r, c)]:
+                                residual.check(part, {"file_id": fp.file_id, "record": r, "column": c},
+                                               ignore_short=True)
+                        elif (r, c) not in fp.changes and value:
                             residual.check(value, {"file_id": fp.file_id, "record": r, "column": c},
                                            numeric_context=not fp.is_outside(r) and r > fp.template.header_row
                                            and c in numeric_cols)

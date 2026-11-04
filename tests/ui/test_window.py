@@ -13,6 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 from maskapp.app.registry import Registry  # noqa: E402
+from maskapp.transform.reviews import Decision  # noqa: E402
 from maskapp.ui.common import MASK  # noqa: E402
 from maskapp.ui.labels import MASKED_TEXT, NOTICE  # noqa: E402
 from maskapp.ui.window import MainWindow  # noqa: E402
@@ -96,6 +97,17 @@ def test_full_flow_through_screens(window, tmp_path, dataset_dir):
     review = w.review
     assert review.list.rowCount() > 0 and not review.next_btn.isEnabled()
     review._register_all()
+    # 備考（文章内の語句）：規則で検出した電話番号は一括で、担当者名らしい語は1件ずつ種類を選んで登録する
+    review._register_values()
+    patterns = [i.subject.get("pattern") for i in review.items]
+    assert "phone" not in patterns and "person_label" in patterns
+    review.list.selectRow(patterns.index("person_label"))
+    assert not review.term_row.isHidden() and review.kind_combo.currentData() == "PERSON"
+    assert not review.buttons[Decision.REGISTER_NEW].isHidden()
+    assert review.buttons[Decision.REGISTER_VALUE].isHidden()
+    text = review.items[review.list.currentRow()].subject["text"]
+    review._decide(Decision.REGISTER_NEW)
+    assert text not in [i.subject.get("text") for i in review.items]
     resolve_reviews(w.session.wb, w.session.run_id)
     review.refresh(reload_units=True)
     assert review.next_btn.isEnabled()

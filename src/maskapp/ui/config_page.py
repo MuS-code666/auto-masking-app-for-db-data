@@ -24,7 +24,7 @@ from maskapp.app.session import Session
 from maskapp.config import Action, ColumnSpec, RelationSpec, Role
 from maskapp.config.suggest import CODE_SCHEMES
 from maskapp.ui.common import MASK, UNCONFIRMED_BG, highlight, run_safely
-from maskapp.ui.labels import ACTIONS, ROLES, VALUE_TYPES
+from maskapp.ui.labels import ACTIONS, OUTSIDE, ROLES, VALUE_TYPES
 
 
 def describe(spec: ColumnSpec, entity_names: dict[str, str]) -> tuple[str, str, str]:
@@ -249,7 +249,7 @@ class ConfigPage(QWidget):
         confirmed = s.draft.confirmed.get(name, set())
         self.region_label.setText(
             f"見出し行：{template.header_row + 1}行目　合計行：{'除く' if template.skip_total_rows else '含める'}　"
-            f"表外：{'内容を消す' if template.outside_action.value == 'clear' else 'そのまま'}（②で変更できます）")
+            f"表外：{OUTSIDE[template.outside_action.value]}（②で変更できます）")
         names = self._entity_names()
         self.columns.setRowCount(len(template.columns))
         for i, spec in enumerate(template.columns):

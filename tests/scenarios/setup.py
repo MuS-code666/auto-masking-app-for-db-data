@@ -115,6 +115,9 @@ def resolve_reviews(wb: Workbench, run_id: int) -> dict[str, int]:
         items = wb.reviews(run_id)
         if not items:
             break
+        # 文章内の候補は、他の判断（別名の登録等）で辞書の語句になることがあるため最後に判断する
+        if any(i.kind is not ReviewKind.FREETEXT_CANDIDATE for i in items):
+            items = [i for i in items if i.kind is not ReviewKind.FREETEXT_CANDIDATE]
         for item in items:
             counts[item.kind.value] = counts.get(item.kind.value, 0) + 1
             if item.kind is ReviewKind.NEW_ENTITY:
@@ -126,6 +129,15 @@ def resolve_reviews(wb: Workbench, run_id: int) -> dict[str, int]:
                 wb.decide(item.id, Decision.LINK_EXISTING, item.subject["candidates"][0]["entity_id"])
             elif item.kind is ReviewKind.RESIDUAL_SHORT:
                 wb.decide(item.id, Decision.FALSE_POSITIVE)
+            elif item.kind is ReviewKind.FREETEXT_AMBIGUOUS:
+                wb.decide(item.id, Decision.REPLACE_TERM, target=item.subject["candidates"][0]["key"])
+            elif item.kind is ReviewKind.FREETEXT_SHORT:
+                wb.decide(item.id, Decision.FALSE_POSITIVE)
+            elif item.kind is ReviewKind.FREETEXT_CANDIDATE:
+                if item.subject.get("info_type"):
+                    wb.decide(item.id, Decision.REGISTER_VALUE, info_type=item.subject["info_type"])
+                else:
+                    wb.decide(item.id, Decision.REGISTER_NEW, entity_type=item.subject["entity_type"])
         wb.decide_all(run_id, ReviewKind.NEW_ENTITY, Decision.REGISTER_NEW)
         wb.plan(run_id)
     return counts

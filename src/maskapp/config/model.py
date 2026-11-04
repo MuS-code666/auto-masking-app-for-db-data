@@ -15,7 +15,7 @@ class Action(StrEnum):
     KEEP = "keep"  # 維持
     REPLACE = "replace"  # 置換
     CLEAR = "clear"  # 内容削除
-    FREETEXT = "freetext"  # 文章内の検出・置換（段階4で実装）
+    FREETEXT = "freetext"  # 文章内の語句の検出・置換（設計書 05 章 4）
 
 
 class Role(StrEnum):
@@ -57,6 +57,7 @@ class OutsideAction(StrEnum):
 
     KEEP = "keep"  # そのまま（残存検査の対象）
     CLEAR = "clear"  # 内容を消す
+    FREETEXT = "freetext"  # 文章内の語句を検出・置換する
 
 
 TOTAL_ROW_WORDS = frozenset({"合計", "総計", "小計", "計", "総合計", "total", "subtotal", "grandtotal"})

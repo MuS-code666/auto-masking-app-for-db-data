@@ -21,6 +21,7 @@ from maskapp.entity.master import Master
 from maskapp.formats.csvfile import CsvDocument
 from maskapp.formats.xlsx.book import XlsxBook
 from maskapp.transform import reviews
+from maskapp.transform.freetext import FreeTextPlanner
 from maskapp.transform.reviews import ReviewKind
 
 CAPACITY_WARN_RATIO = 0.2
@@ -33,7 +34,7 @@ class Assignment:
     """1セルの変換結果。value が None なら未解決（人の判断待ち）。"""
 
     value: str | None
-    kind: str  # "entity_code" / "entity_name" / "token" / "clear"
+    kind: str  # "entity_code" / "entity_name" / "token" / "clear" / "freetext"
     ref: str | None = None  # entity_id または info_type
     scheme_id: int | None = None
 
@@ -91,6 +92,8 @@ class FilePlan:
     grid: Grid
     changes: dict[tuple[int, int], Assignment] = field(default_factory=dict)
     data_rows: list[int] = field(default_factory=list)  # データ行（合計行を除く設定ならそれを除く）
+    # 文章内を検査したセル → 置換しなかった部分（検証ではこの部分を残存検査する）
+    freetext: dict[tuple[int, int], tuple[str, ...]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.data_rows:
@@ -126,10 +129,11 @@ class Plan:
     run_files: list[RunFile] = field(default_factory=list)
     sources: dict[int, Source] = field(default_factory=dict)
     books: dict = field(default_factory=dict)  # file_id → xlsx_plan.BookPlan
+    freetext: FreeTextPlanner | None = None
 
     @property
     def unresolved(self) -> int:
-        return sum(f.unresolved for f in self.files)
+        return sum(f.unresolved for f in self.files) + sum(b.unresolved for b in self.books.values())
 
     def units_of(self, file_id: int) -> list[FilePlan]:
         return [f for f in self.files if f.file_id == file_id]
@@ -294,9 +298,6 @@ def build_plan(
     layouts = {}
     for unit in ordered:
         template = config.template(unit.template_name)
-        for c in template.columns:
-            if c.action is Action.FREETEXT:
-                raise ConfigError("free-text processing is not available yet (planned for phase 4)")
         layouts[unit.template_name] = (template, _bindings(conn, template))
     grids = {(u.file_id, u.sheet): grid_of(sources[u.file_id], u.sheet) for u in ordered}
 
@@ -369,6 +370,10 @@ def build_plan(
                             fp.changes[(r, c)] = Assignment("", "clear")
         files.append(fp)
 
+    # 3. 文章内の語句（対応表が出そろった後に、その作業で仮登録した対象も含めて検索する）
+    freetext = FreeTextPlanner(conn, run_id)
+    replaced = sum(_plan_freetext(fp, freetext) for fp in files)
+
     notes = [
         PlanNote(origin, severity, kind, {**dict(detail), "count": count})
         for (origin, severity, kind, detail), count in resolver.notes.items()
@@ -378,16 +383,58 @@ def build_plan(
         if capacity and capacity - used < capacity * CAPACITY_WARN_RATIO:
             notes.append(PlanNote("transform", "warn", "code_capacity_low",
                                   {"scheme_id": scheme_id, "used": used, "capacity": capacity}))
-    plan = Plan(run_id, config, files, notes, sorted(run_files, key=lambda f: f.position), dict(sources))
+    plan = Plan(run_id, config, files, notes, sorted(run_files, key=lambda f: f.position), dict(sources),
+                freetext=freetext)
 
-    # 3. xlsx のブック全体の変更（対応表が出そろった後に、数式の文字列定数・キャッシュ値を決める）
+    # 4. xlsx のブック全体の変更（対応表が出そろった後に、数式の文字列定数・キャッシュ値を決める）
     for rf in plan.run_files:
         source = sources[rf.file_id]
         if isinstance(source, XlsxBook):
             book_plan = plan_book(conn, plan, rf, source)
             plan.books[rf.file_id] = book_plan
             plan.notes.extend(book_plan.notes)
+    if replaced:
+        plan.notes.append(PlanNote("transform", "info", "freetext_replaced", {"count": replaced}))
     return plan
+
+
+def _plan_freetext(fp: FilePlan, freetext: FreeTextPlanner) -> int:
+    """「文章内を検査」の列と、表外を「文章内を検査」にした表の表外のセル。置換したセル数を返す。"""
+    template = fp.template
+    columns = [i for i, c in enumerate(template.columns) if c.action is Action.FREETEXT]
+    outside = template.outside_action is OutsideAction.FREETEXT
+    if not columns and not outside:
+        return 0
+    row_entities: dict[int, set[str]] = {}
+    for (r, _), a in fp.changes.items():
+        if a.kind in ("entity_code", "entity_name") and a.ref:
+            row_entities.setdefault(r, set()).add(a.ref)
+
+    replaced = 0
+
+    def apply(r: int, c: int, scope: str, label: str) -> None:
+        nonlocal replaced
+        text = fp.grid.cell(r, c)
+        location = {"file_id": fp.file_id, "sheet": fp.sheet, "record": r, "column": c}
+        result = freetext.process(text, scope, label, location, frozenset(row_entities.get(r, ())))
+        if result is None:
+            return
+        fp.freetext[(r, c)] = result.kept
+        if result.value is None or result.changed:
+            fp.changes[(r, c)] = Assignment(result.value, "freetext")
+            replaced += result.changed
+
+    for c in columns:
+        header = template.columns[c].header
+        for r in fp.data_rows:
+            if not fp.grid.blank[r]:
+                apply(r, c, f"col:{template.name}:{header}", f"{template.name}・{header}")
+    if outside:
+        for r, values in enumerate(fp.grid.rows):
+            if fp.is_outside(r):
+                for c in range(len(values)):
+                    apply(r, c, f"outside:{template.name}", f"{template.name}・表外")
+    return replaced
 
 
 def render_file(plan: Plan, file_id: int) -> bytes:

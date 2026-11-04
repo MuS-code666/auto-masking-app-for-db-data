@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from maskapp.app import Workbench
-from maskapp.config import Action, ColumnSpec, ConfigError, TemplateSpec
+from maskapp.config import Action, ColumnSpec, TemplateSpec
 from maskapp.project import Project
 from maskapp.transform.reviews import Decision, ReviewKind
 from tests.scenarios.setup import TEMPLATES, add_files, keep, name, write_csv_dataset
@@ -88,7 +88,8 @@ def test_link_new_entity_to_existing_leaves_gap(setup, tmp_path):
     assert status == "void"  # 紐付けた仮登録の番号は欠番
 
 
-def test_freetext_is_rejected_until_phase4(tmp_path):
+def test_freetext_column_without_terms_is_unchanged(tmp_path):
+    """辞書の語句も候補もない文章は、そのまま出力する（段階4）。"""
     with Project.create(tmp_path, "自由記述") as project:
         wb = Workbench(project)
         wb.save_config([TemplateSpec("t", [ColumnSpec("備考", Action.FREETEXT)])])
@@ -96,5 +97,5 @@ def test_freetext_is_rejected_until_phase4(tmp_path):
         path.write_bytes("備考\r\nこんにちは\r\n".encode("cp932"))
         run = wb.start_run()
         add_files(wb, run, [path])
-        with pytest.raises(ConfigError):
-            wb.plan(run)
+        summary = wb.plan(run)
+        assert summary.changed_cells == 0 and summary.open_reviews == 0

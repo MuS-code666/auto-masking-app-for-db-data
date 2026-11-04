@@ -243,4 +243,6 @@ def make_value_token(info_type: str, seq: int) -> str:
         return f"住所{seq:04d}"
     if kind == "POSTAL":
         return f"000-{seq:04d}"
+    if kind == "URL":
+        return f"https://example.invalid/{seq:04d}"
     return f"{info_type}{seq:04d}"

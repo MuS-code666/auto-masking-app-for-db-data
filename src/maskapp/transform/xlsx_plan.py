@@ -7,6 +7,7 @@
 - キャッシュ値：文字列のキャッシュ値が登録語句と完全に一致すれば置換し、一部に含む場合は
   キャッシュ値を消す（Excel が開いたときに再計算する）
 - 文字列を加工する数式（LEFT・& 等）は、再計算の結果が変わり得るため警告する
+- ヘッダー・フッター、グラフの文字（系列名・項目名のキャッシュ、タイトル）は文章内の語句と同じ規則で置換する
 """
 
 from __future__ import annotations
@@ -14,8 +15,9 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field, fields
 
-from maskapp.formats.xlsx.book import BookEdits, XlsxBook, cell_ref
+from maskapp.formats.xlsx.book import BookEdits, XlsxBook, cell_ref, text_nodes, text_part_kind
 from maskapp.formats.xlsx.formula import FormulaInfo, FormulaSyntaxError, analyze, replace_constants
+from maskapp.formats.xlsx.package import parse_xml
 from maskapp.transform.planner import Plan, PlanNote, RunFile
 from maskapp.verify.residual import ResidualScanner, dictionary_terms, replacement_map
 
@@ -53,6 +55,12 @@ class BookPlan:
     notes: list[PlanNote]
     generated: set[Key] = field(default_factory=set)  # 計画で作った値のセル（残存検査の対象外）
     blocked_formulas: set[Key] = field(default_factory=set)  # 停止の注記を出した数式セル
+    freetext: dict[Key, tuple[str, ...]] = field(default_factory=dict)  # 文章内を検査したセル → 置換しなかった部分
+    part_texts: dict[tuple[str, int], tuple[str, ...]] = field(default_factory=dict)  # 部品の文字 → 置換しなかった部分
+    unresolved: int = 0  # 判断待ちの部品の文字
+
+    def checked_part_texts(self, part: str) -> dict[int, tuple[str, ...]]:
+        return {i: kept for (p, i), kept in self.part_texts.items() if p == part}
 
 
 def _cells(keys: list[Key]) -> list[dict]:
@@ -114,6 +122,13 @@ def plan_book(conn, plan: Plan, rf: RunFile, book: XlsxBook) -> BookPlan:
             if a.value is None or cell is None:
                 continue
             key = (fp.sheet, r, c)
+            if a.kind == "freetext":
+                if cell.formula is not None:
+                    continue  # 数式セルは数式の扱い（文字列定数・キャッシュ値）で処理する
+                edits.edit(*key).value = a.value
+                if cell.rich:
+                    rich.append(key)
+                continue
             edit = edits.edit(*key)
             if a.kind == "clear":
                 edit.clear = True
@@ -124,6 +139,12 @@ def plan_book(conn, plan: Plan, rf: RunFile, book: XlsxBook) -> BookPlan:
                 bp.generated.add(key)
                 if cell.rich:
                     rich.append(key)
+    for fp in plan.units_of(rf.file_id):
+        sheet = book.sheet(fp.sheet)
+        for (r, c), kept in fp.freetext.items():
+            cell = sheet.cells.get((r, c))
+            if cell is not None and cell.formula is None:
+                bp.freetext[(fp.sheet, r, c)] = kept
     if rich:
         notes.append(PlanNote("source", "warn", "rich_text_flattened", {**loc, "count": len(rich),
                                                                        "cells": _cells(rich)}))
@@ -192,7 +213,7 @@ def plan_book(conn, plan: Plan, rf: RunFile, book: XlsxBook) -> BookPlan:
                 found["formula_constant_replaced"].append(key)
 
             # キャッシュ値（表の単位で値を決めたセルは除く）
-            if key in bp.generated or cell.kind != "string" or not cell.text:
+            if key in bp.generated or key in bp.freetext or cell.kind != "string" or not cell.text:
                 continue
             result = classify(cell.text)
             if result:
@@ -216,6 +237,29 @@ def plan_book(conn, plan: Plan, rf: RunFile, book: XlsxBook) -> BookPlan:
     for kind, keys in sorted(found.items()):
         origin = "transform" if severities[kind] in ("info", "warn") else "source"
         notes.append(PlanNote(origin, severities[kind], kind, {**loc, "count": len(keys), "cells": _cells(keys)}))
+    # 3. ヘッダー・フッター、グラフの文字
+    replaced_parts = 0
+    for name in book.pkg.order:
+        kind = text_part_kind(book, name)
+        if kind is None or (kind == "chart" and options.remove_charts):
+            continue
+        data = book.pkg.data[name]
+        if kind == "worksheet" and b"headerFooter" not in data:
+            continue
+        label = "ヘッダー・フッター" if kind == "worksheet" else "グラフ"
+        for i, node in enumerate(text_nodes(parse_xml(data), kind)):
+            result = plan.freetext.process(node.text or "", f"part:{kind}", label, {**loc, "part": name})
+            if result is None:
+                continue
+            bp.part_texts[(name, i)] = result.kept
+            if result.value is None:
+                bp.unresolved += 1
+            elif result.changed:
+                edits.part_texts.setdefault(name, {})[i] = result.value
+                replaced_parts += 1
+    if replaced_parts:
+        notes.append(PlanNote("transform", "info", "part_text_replaced", {**loc, "count": replaced_parts}))
+
     if has_formula and edits.cells:
         edits.full_calc_on_load = True
         notes.append(PlanNote("transform", "info", "recalculate_on_open", loc))

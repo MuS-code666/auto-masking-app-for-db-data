@@ -27,6 +27,7 @@ from pathlib import Path
 from maskapp.config import Config, RelationSpec, TemplateSpec, load_config, match_template, save_config
 from maskapp.config.model import ConfigError
 from maskapp.entity.master import Master
+from maskapp.entity.normalize import normalize_for_search
 from maskapp.formats.csvfile import CsvDocument
 from maskapp.infra.safelog import get_logger
 from maskapp.ingest import ImportedFile, Source, import_csv, import_file, load_source
@@ -36,10 +37,12 @@ from maskapp.transform.planner import Plan, RunFile, RunUnit, build_plan, grid_o
 from maskapp.transform.reviews import ALLOWED, Decision, ReviewItem, ReviewKind
 from maskapp.transform.xlsx_plan import BookOptions
 from maskapp.verify.checks import VerifyReport, verify
+from maskapp.verify.residual import is_short
 
 _log = get_logger("workbench")
 _PARTIAL_SUFFIX = ".partial"
 _INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+VALUE_TYPES = ("PHONE", "EMAIL", "POSTAL", "URL", "ADDRESS")  # 文章内の候補を値として登録するときの種類
 
 
 class RunState(StrEnum):
@@ -408,34 +411,62 @@ class Workbench:
     def reviews(self, run_id: int, state: str | None = "open") -> list[ReviewItem]:
         return reviews.list_items(self.conn, run_id, state)
 
-    def decide(self, item_id: int, decision: Decision, entity_id: str | None = None) -> None:
+    def decide(self, item_id: int, decision: Decision, entity_id: str | None = None, *,
+               target: str | None = None, entity_type: str | None = None, info_type: str | None = None,
+               text: str | None = None) -> None:
+        """要確認を判断する。
+
+        文章内の語（短い語・置換先が複数）：REPLACE_TERM で target（候補の key）を選ぶ、または FALSE_POSITIVE。
+        文章内の候補：REGISTER_NEW（entity_type）・LINK_EXISTING（entity_id）・REGISTER_VALUE（info_type）で
+        登録して置換する、または FALSE_POSITIVE。text で登録する語句を候補の一部に絞れる。
+        """
         item = reviews.get(self.conn, item_id)
         run_id = self.conn.execute("SELECT run_id FROM review_item WHERE id = ?", (item_id,)).fetchone()[0]
         self._require(run_id, RunState.PLANNED, RunState.STAGED, RunState.VERIFIED)
         if decision not in ALLOWED[item.kind]:
             raise ValueError(f"decision {decision.value} is not allowed for {item.kind.value}")
         with self.project.transaction() as conn:
-            self._apply_decision(conn, run_id, item, decision, entity_id)
+            self._apply_decision(conn, run_id, item, decision, entity_id, target=target, entity_type=entity_type,
+                                 info_type=info_type, text=text)
             self._back_to_planned(conn, run_id)
 
     def decide_all(self, run_id: int, kind: ReviewKind, decision: Decision) -> int:
-        """同じ種類の未確認項目を一括で判断する（例：新しい対象の一括確定）。"""
+        """同じ種類の未確認項目を一括で判断する（例：新しい対象の一括確定）。
+
+        文章内の候補の REGISTER_VALUE は、電話番号・メール等として検出した候補だけを、検出した種類で登録する。
+        """
         items = [i for i in self.reviews(run_id) if i.kind is kind]
+        if kind is ReviewKind.FREETEXT_CANDIDATE and decision is Decision.REGISTER_VALUE:
+            items = [i for i in items if i.subject.get("info_type")]
+        elif kind is ReviewKind.FREETEXT_CANDIDATE and decision is Decision.REGISTER_NEW:
+            raise ValueError("candidates must be registered one by one (choose the entity type)")
         if decision not in ALLOWED[kind]:
             raise ValueError(f"decision {decision.value} is not allowed for {kind.value}")
-        if decision is Decision.LINK_EXISTING:
-            raise ValueError("linking to an existing entity must be decided one by one")
+        if decision in (Decision.LINK_EXISTING, Decision.REPLACE_TERM):
+            raise ValueError("this decision must be made one by one")
         self._require(run_id, RunState.PLANNED, RunState.STAGED, RunState.VERIFIED)
         with self.project.transaction() as conn:
             for item in items:
-                self._apply_decision(conn, run_id, item, decision, None)
+                self._apply_decision(conn, run_id, item, decision, None, info_type=item.subject.get("info_type"))
             self._back_to_planned(conn, run_id)
         return len(items)
 
-    def _apply_decision(self, conn, run_id: int, item: ReviewItem, decision: Decision, entity_id: str | None):
+    def _apply_decision(self, conn, run_id: int, item: ReviewItem, decision: Decision, entity_id: str | None,
+                        **options):
         master = Master(conn)
         subject = item.subject
         record: dict = {"decision": decision.value}
+        if item.kind in (ReviewKind.FREETEXT_SHORT, ReviewKind.FREETEXT_AMBIGUOUS):
+            if decision is Decision.REPLACE_TERM:
+                keys = {c["key"] for c in subject.get("candidates", [])}
+                if options.get("target") not in keys:
+                    raise ValueError("choose one of the replacement candidates")
+                record["target"] = options["target"]
+            reviews.set_decision(conn, item.id, record)
+            return
+        if item.kind is ReviewKind.FREETEXT_CANDIDATE:
+            self._apply_candidate(conn, run_id, item, decision, entity_id, record, **options)
+            return
         if decision is Decision.LINK_EXISTING:
             if not entity_id:
                 raise ValueError("entity_id is required to link to an existing entity")
@@ -458,6 +489,38 @@ class Workbench:
             new_id = master.create_entity(subject["entity_type"], run_id)
             master.add_name(new_id, subject["name"], "primary", run_id)
             record["entity_id"] = new_id
+        reviews.set_decision(conn, item.id, record)
+
+    def _apply_candidate(self, conn, run_id: int, item: ReviewItem, decision: Decision, entity_id: str | None,
+                         record: dict, target=None, entity_type=None, info_type=None, text=None) -> None:
+        """規則で検出した候補を、対象の名称・別名または値として登録する（以後は辞書の語句として置換する）。"""
+        master = Master(conn)
+        found = item.subject["text"]
+        text = found if text is None else text.strip()
+        if decision is not Decision.FALSE_POSITIVE:
+            if not text or text not in found:
+                raise ValueError("the registered text must be part of the detected text")
+            if text != found and is_short(normalize_for_search(text)):
+                raise ValueError("a short word cannot be registered from part of a candidate")
+            record["text"] = text
+        if decision is Decision.REGISTER_NEW:
+            exists = conn.execute("SELECT 1 FROM entity_type WHERE id = ?", (entity_type,)).fetchone()
+            if not exists:
+                raise ValueError("choose the entity type to register")
+            new_id = master.create_entity(entity_type, run_id)
+            master.add_name(new_id, text, "primary", run_id)
+            record.update(entity_id=new_id, target=f"name:{new_id}")
+        elif decision is Decision.LINK_EXISTING:
+            status = conn.execute("SELECT status FROM entity WHERE id = ?", (entity_id,)).fetchone()
+            if not entity_id or status is None or status[0] not in ("draft", "confirmed"):
+                raise ValueError("target entity does not exist")
+            master.add_name(entity_id, text, "alias", run_id)
+            record.update(entity_id=entity_id, target=f"name:{entity_id}")
+        elif decision is Decision.REGISTER_VALUE:
+            if info_type not in VALUE_TYPES:
+                raise ValueError("choose the value type to register")
+            master.value_token(info_type, text, run_id)
+            record.update(info_type=info_type, target=f"value:{info_type}:{text}")
         reviews.set_decision(conn, item.id, record)
 
     def forget_decision(self, item_id: int) -> None:

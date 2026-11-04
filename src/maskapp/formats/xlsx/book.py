@@ -10,6 +10,8 @@
   - 変更するセルだけ <c> 要素を書き換える。数式は残し、キャッシュ値を置き換える。
   - 共有文字列表は全体を作り直す（どのセルからも参照されない元の文字列を残さない）。
   - 文書プロパティは空に初期化し、サムネイル・ユーザー定義プロパティは除く。
+  - ヘッダー・フッター、グラフの文字（系列名・項目名のキャッシュ、タイトル）は text_nodes で
+    取り出した要素の文字を置き換える（要素の順番で指定する）。
   - 書き換えない部品は元のバイト列のまま格納する。
 """
 
@@ -37,6 +39,9 @@ _XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
 _MC_NS = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 _ABS_PATH = "{http://schemas.microsoft.com/office/spreadsheetml/2010/11/ac}absPath"
 _CHART_NS = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+_DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+_HEADER_FOOTER = ("oddHeader", "oddFooter", "evenHeader", "evenFooter", "firstHeader", "firstFooter")
+_STRING_CACHES = ("strCache", "strLit", "lvl")
 _SST_TYPE = f"{OFFICE_REL}/sharedStrings"
 _SST_CT = "application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"
 
@@ -335,9 +340,49 @@ class BookEdits:
     remove_charts: bool = False
     full_calc_on_load: bool = False
     drop_calc_chain: bool = False
+    # 部品の文字の置換：部品名 → {text_nodes の順番: 新しい文字}
+    part_texts: dict[str, dict[int, str]] = field(default_factory=dict)
 
     def edit(self, sheet: int, row: int, col: int) -> CellEdit:
         return self.cells.setdefault((sheet, row, col), CellEdit())
+
+
+def text_part_kind(book: XlsxBook, name: str) -> str | None:
+    """文字を置換できる部品の種類："worksheet"（ヘッダー・フッター）、"chart"（グラフ）。"""
+    if name in {s.part for s in book.sheets}:
+        return "worksheet"
+    if "drawingml.chart+xml" in book.pkg.content_type(name):
+        return "chart"
+    return None
+
+
+def text_nodes(root: etree._Element, kind: str) -> list[etree._Element]:
+    """置換の対象にする文字の要素（文書順）。"""
+    if kind == "worksheet":
+        hf = root.find(f"{_M}headerFooter")
+        if hf is None:
+            return []
+        return [el for el in hf if isinstance(el.tag, str) and etree.QName(el).localname in _HEADER_FOOTER]
+    nodes = []
+    for el in root.iter():
+        if not isinstance(el.tag, str):
+            continue
+        q = etree.QName(el)
+        if q.namespace == _CHART_NS and q.localname == "v":
+            pt = el.getparent()
+            cache = pt.getparent() if pt is not None else None
+            if (pt is not None and etree.QName(pt).localname == "pt" and cache is not None
+                    and etree.QName(cache).localname in _STRING_CACHES):
+                nodes.append(el)
+        elif q.namespace == _DRAWING_NS and q.localname == "t":
+            nodes.append(el)
+    return nodes
+
+
+def _apply_part_texts(root: etree._Element, kind: str, texts: dict[int, str]) -> None:
+    nodes = text_nodes(root, kind)
+    for i, text in texts.items():
+        nodes[i].text = text
 
 
 def _child(el: etree._Element, local: str) -> etree._Element | None:
@@ -630,10 +675,24 @@ def render(book: XlsxBook, edits: BookEdits) -> bytes:
 
     # 3. 共有文字列表の作り直し
     _rebuild_shared_strings(pkg, fresh, trees, new_strings, original_si, rich_props)
+
+    # 4. 部品の文字（ヘッダー・フッター、グラフ）
+    for part, texts in sorted(edits.part_texts.items()):
+        if part not in pkg.data or part in removed:
+            continue
+        kind = text_part_kind(fresh, part)
+        if kind == "worksheet":
+            if part not in trees:
+                trees[part] = parse_xml(pkg.data[part])
+            _apply_part_texts(trees[part], kind, texts)
+        elif kind == "chart":
+            root = parse_xml(pkg.data[part])
+            _apply_part_texts(root, kind, texts)
+            pkg.put(part, serialize_xml(root))
     for part, root in trees.items():
         pkg.put(part, serialize_xml(root))
 
-    # 4. ブック（再計算の設定・保存場所の記録）
+    # 5. ブック（再計算の設定・保存場所の記録）
     wb_root = parse_xml(pkg.data[fresh.workbook_part])
     changed = _remove_abs_path(wb_root)
     if edits.full_calc_on_load:
@@ -642,7 +701,7 @@ def render(book: XlsxBook, edits: BookEdits) -> bytes:
     if changed:
         pkg.put(fresh.workbook_part, serialize_xml(wb_root))
 
-    # 5. 文書プロパティの初期化
+    # 6. 文書プロパティの初期化
     for info in pkg.parts():
         if info.feature != "properties":
             continue

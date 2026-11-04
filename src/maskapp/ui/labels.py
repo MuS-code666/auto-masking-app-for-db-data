@@ -8,10 +8,10 @@ MASKED_TEXT = "●●●"
 
 STEPS = ["① プロジェクト", "② ファイル取込", "③ 変換設定", "④ 変換前後の確認", "⑤ 検証・出力"]
 
-ACTIONS = {"keep": "維持", "replace": "置換", "clear": "内容を消す", "freetext": "文章内を検査（段階4）"}
+ACTIONS = {"keep": "維持", "replace": "置換", "clear": "内容を消す", "freetext": "文章内の語句を置換"}
 ROLES = {"code": "コード", "name": "名称", "value": "その他の値"}
-VALUE_TYPES = {"PHONE": "電話番号", "EMAIL": "メール", "POSTAL": "郵便番号", "ADDRESS": "住所"}
-OUTSIDE = {"keep": "そのまま（残存検査の対象）", "clear": "内容を消す"}
+VALUE_TYPES = {"PHONE": "電話番号", "EMAIL": "メール", "POSTAL": "郵便番号", "ADDRESS": "住所", "URL": "URL"}
+OUTSIDE = {"freetext": "文章内の語句を置換", "keep": "そのまま（残存検査の対象）", "clear": "内容を消す"}
 
 REVIEW_KINDS = {
     "new_entity": "新しい対象",
@@ -19,13 +19,22 @@ REVIEW_KINDS = {
     "name_ambiguous": "同じ名称の対象が複数",
     "similar_name": "似た名称",
     "residual_short": "短い語の残り",
+    "freetext_short": "文章内の短い語",
+    "freetext_ambiguous": "文章内の語の置換先",
+    "freetext_candidate": "文章内の候補（規則で検出）",
+}
+CANDIDATE_PATTERNS = {
+    "phone": "電話番号らしい語", "email": "メールアドレスらしい語", "postal": "郵便番号らしい語", "url": "URL",
+    "company": "法人名らしい語", "honorific": "敬称（様・御中・殿）の付いた語", "person_label": "担当者名らしい語",
 }
 DECISIONS = {
     "register_new": "新しい対象として登録",
     "link_existing": "既存の対象に紐付け",
     "add_alias": "別名として登録",
     "keep_as_source_error": "元データの誤りとして扱う",
-    "false_positive": "問題なし",
+    "false_positive": "問題なし（置換しない）",
+    "replace_term": "選んだ置換先で置換する",
+    "register_value": "値として登録して置換する",
 }
 
 FINDINGS = {
@@ -73,6 +82,8 @@ FINDINGS = {
     "formula_converted_to_value": "数式を値に変換しました",
     "formula_constant_replaced": "数式の文字列を置換しました",
     "formula_cache_replaced": "数式の計算結果を置換しました",
+    "freetext_replaced": "文章内の語句を置換しました（セル数）",
+    "part_text_replaced": "ヘッダー・フッター、グラフの文字を置換しました",
     "recalculate_on_open": "Excel で開いたときに再計算する設定にしました（閉じるときに保存の確認が出ることがあります）",
     "rich_text_flattened": "書式付きの文字列を1つの書式にまとめました",
     "images_not_inspected": "画像の中身は検査していません",

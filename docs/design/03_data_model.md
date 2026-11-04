@@ -99,6 +99,8 @@ erDiagram
 | info_type | `ADDRESS`, `PHONE`, `EMAIL` など |
 | original_value, masked_value, seq, status | 種類ごとの連番で生成 |
 
+段階4 の実装では、文章内で見つけた語句の登録は対象の名称・別名（entity_name）または値対応（value_token）として行い、term 表は使っていない（取消・確定・対応表の管理を共通にするため）。置換しない判断は要確認項目の判断として記録し、作業をまたいで引き継ぐ（decision_memory）。
+
 ### term（自由記述用の追加語句）
 対象の名称・コード以外で、自由記述から検出・置換したい語句（担当者名の一部、プロジェクト名等）や、置換しない語句。
 | 列 | 説明 |
@@ -182,7 +184,7 @@ erDiagram
 ### review_item（要確認）
 | 列 | 説明 |
 |---|---|
-| kind | `new_entity`, `code_multi_name`, `name_multi_code`, `similar_name`, `code_missing`, `freetext_candidate`, `type_ambiguous`, `column_change`, `excel_feature`, `residual` |
+| kind | `new_entity`, `code_multi_name`, `name_multi_code`, `similar_name`, `code_missing`, `freetext_candidate`, `type_ambiguous`, `column_change`, `excel_feature`, `residual` （実装：`new_entity`, `code_multi_name`, `name_ambiguous`, `similar_name`, `residual_short`, `freetext_short`, `freetext_ambiguous`, `freetext_candidate`） |
 | location | ファイル・シート・行・列（値そのものは別列で保持） |
 | decision | `register_new`, `link_existing`, `add_alias`, `keep`, `clear`, `false_positive` 等 |
 | state | `open`／`decided` |

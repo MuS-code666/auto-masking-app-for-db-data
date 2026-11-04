@@ -16,7 +16,7 @@ from datetime import date, datetime, time
 from lxml import etree
 
 from maskapp.config.model import Action
-from maskapp.formats.xlsx.book import MAIN_NS, Cell, CellEdit, XlsxBook
+from maskapp.formats.xlsx.book import MAIN_NS, Cell, CellEdit, XlsxBook, text_nodes, text_part_kind
 from maskapp.formats.xlsx.package import Package, XlsxFormatError, classify, parse_xml, source_of_rels
 from maskapp.transform.planner import Plan, RunFile
 from maskapp.transform.xlsx_plan import BookPlan
@@ -156,7 +156,29 @@ def _scan_part_tree(root: etree._Element, residual: ResidualCheck, location: dic
                                numeric_context=bool(_NUMBER_ONLY.match(value)))
 
 
-def _scan_parts(out: XlsxBook, residual: ResidualCheck, file_id: int) -> None:
+def _check_part_texts(out: XlsxBook, name: str, root: etree._Element, bp: BookPlan, residual: ResidualCheck,
+                      findings: list[Finding], location: dict) -> None:
+    """文章内の規則で処理した文字（ヘッダー・フッター、グラフ）：計画どおりの文字か確かめ、
+    置換しなかった部分だけを残存検査する。検査した要素は部品全体の検査から外す。"""
+    checked = bp.checked_part_texts(name)
+    if not checked:
+        return
+    kind = text_part_kind(out, name)
+    nodes = text_nodes(root, kind) if kind else []
+    planned = bp.edits.part_texts.get(name, {})
+    for i, kept in checked.items():
+        if i >= len(nodes):
+            findings.append(Finding("transform", "block", "planned_value_mismatch", location))
+            continue
+        if i in planned and nodes[i].text != planned[i]:
+            findings.append(Finding("transform", "block", "planned_value_mismatch", location))
+        for part in kept:
+            residual.check(part, location, ignore_short=True)
+        nodes[i].text = None
+
+
+def _scan_parts(out: XlsxBook, residual: ResidualCheck, file_id: int, bp: BookPlan,
+                findings: list[Finding]) -> None:
     worksheet_parts = {s.part for s in out.sheets}
     for name in out.pkg.order:
         info = classify(name, out.pkg.content_type(name))
@@ -170,6 +192,7 @@ def _scan_parts(out: XlsxBook, residual: ResidualCheck, file_id: int) -> None:
             # VML 等の整形式でない部品は、タグを除いた文字列を検査する
             residual.check(_TAG.sub(" ", data.decode("utf-8", errors="replace")), location)
             continue
+        _check_part_texts(out, name, root, bp, residual, findings, location)
         if name in worksheet_parts:
             sheet_data = root.find(f"{_M}sheetData")
             if sheet_data is not None:
@@ -240,12 +263,15 @@ def verify_book(plan: Plan, rf: RunFile, src: XlsxBook, data: bytes, findings: l
         for (r, c), cell in sheet.cells.items():
             key = (sheet.idx, r, c)
             location = {**loc, "sheet": sheet.idx, "row": r, "column": c}
-            if cell.text and key not in bp.generated:
+            if key in bp.freetext:
+                for part in bp.freetext[key]:
+                    residual.check(part, location, ignore_short=True)
+            elif cell.text and key not in bp.generated:
                 numeric = (cell.kind == "number" and fp is not None and c in keep_cols
                            and r > fp.template.header_row and not fp.is_outside(r))
                 residual.check(cell.text, location, numeric_context=numeric)
             if cell.formula is not None and cell.formula.text and key not in bp.blocked_formulas:
                 residual.check(cell.formula.text, {**location, "part": "formula"})
     # V7 残存（セル以外の全部品）・V9 シート名
-    _scan_parts(out, residual, rf.file_id)
+    _scan_parts(out, residual, rf.file_id, bp, findings)
     return out

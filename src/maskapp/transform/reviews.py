@@ -16,6 +16,9 @@ class ReviewKind(StrEnum):
     NAME_AMBIGUOUS = "name_ambiguous"  # 同じ名称の対象が複数（コードなしの列）
     SIMILAR_NAME = "similar_name"  # 正規化で一致する別表記
     RESIDUAL_SHORT = "residual_short"  # 短い語の残存（人が判断）
+    FREETEXT_SHORT = "freetext_short"  # 文章内の短い語（置換するかを人が判断。列ごと）
+    FREETEXT_AMBIGUOUS = "freetext_ambiguous"  # 文章内の語で置換先が複数（列ごとに置換先を選ぶ）
+    FREETEXT_CANDIDATE = "freetext_candidate"  # 規則で検出した候補（電話番号・法人名らしい語 等）
 
 
 class Decision(StrEnum):
@@ -24,6 +27,8 @@ class Decision(StrEnum):
     ADD_ALIAS = "add_alias"  # 別名として登録
     KEEP_AS_SOURCE_ERROR = "keep_as_source_error"  # 元データの誤りとして扱う（コードの対象名で置換）
     FALSE_POSITIVE = "false_positive"  # 問題なし（誤検出）
+    REPLACE_TERM = "replace_term"  # 選んだ置換先で置換する（文章内の語）
+    REGISTER_VALUE = "register_value"  # 値（電話番号・メール等）として登録して置換する
 
 
 ALLOWED: dict[ReviewKind, set[Decision]] = {
@@ -32,12 +37,19 @@ ALLOWED: dict[ReviewKind, set[Decision]] = {
     ReviewKind.NAME_AMBIGUOUS: {Decision.LINK_EXISTING, Decision.REGISTER_NEW},
     ReviewKind.SIMILAR_NAME: {Decision.LINK_EXISTING, Decision.REGISTER_NEW},
     ReviewKind.RESIDUAL_SHORT: {Decision.FALSE_POSITIVE},
+    ReviewKind.FREETEXT_SHORT: {Decision.REPLACE_TERM, Decision.FALSE_POSITIVE},
+    ReviewKind.FREETEXT_AMBIGUOUS: {Decision.REPLACE_TERM},
+    ReviewKind.FREETEXT_CANDIDATE: {Decision.REGISTER_NEW, Decision.LINK_EXISTING, Decision.REGISTER_VALUE,
+                                    Decision.FALSE_POSITIVE},
 }
 
 
 # 作業をまたいで引き継ぐ判断の種類。確定した作業の判断を記録し、次の作業で同じ項目に自動で適用する
 # （画面に「前回の判断」と表示し、利用者は取り消して判断し直せる）
-REMEMBERED = {ReviewKind.CODE_MULTI_NAME, ReviewKind.NAME_AMBIGUOUS}
+# 文章内の判断は、置換先が取り消し・統合されていれば計画の作成時に判断し直しを求める
+REMEMBERED = {ReviewKind.CODE_MULTI_NAME, ReviewKind.NAME_AMBIGUOUS, ReviewKind.FREETEXT_SHORT,
+              ReviewKind.FREETEXT_AMBIGUOUS, ReviewKind.FREETEXT_CANDIDATE}
+FREETEXT_KINDS = {ReviewKind.FREETEXT_SHORT, ReviewKind.FREETEXT_AMBIGUOUS, ReviewKind.FREETEXT_CANDIDATE}
 
 
 @dataclass(frozen=True)
@@ -133,7 +145,9 @@ def remember_run(conn: sqlite3.Connection, run_id: int) -> int:
             continue
         d = json.loads(decision)
         d.pop("remembered", None)
-        if ReviewKind(kind) is ReviewKind.NAME_AMBIGUOUS:
+        if ReviewKind(kind) in FREETEXT_KINDS:
+            pass  # 判断（置換先・問題なし）をそのまま引き継ぐ
+        elif ReviewKind(kind) is ReviewKind.NAME_AMBIGUOUS:
             d = {"decision": Decision.LINK_EXISTING.value, "entity_id": d["entity_id"]}
         elif d.get("decision") != Decision.KEEP_AS_SOURCE_ERROR.value:
             continue  # 別名の登録は対応表に残るため記録不要

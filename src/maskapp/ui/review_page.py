@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QPushButton,
     QSplitter,
     QTableView,
@@ -23,7 +24,7 @@ from PySide6.QtWidgets import (
 from maskapp.app.session import Session
 from maskapp.transform.reviews import ALLOWED, Decision, ReviewItem, ReviewKind
 from maskapp.ui.common import CHANGED_BG, CLEARED_BG, HEADER_BG, MASK, GridModel, run_safely
-from maskapp.ui.labels import DECISIONS, REVIEW_KINDS
+from maskapp.ui.labels import CANDIDATE_PATTERNS, DECISIONS, REVIEW_KINDS, VALUE_TYPES
 
 
 def describe_item(item: ReviewItem) -> str:
@@ -42,6 +43,12 @@ def describe_item(item: ReviewItem) -> str:
         loc = item.location
         where = f"行 {loc.get('record', loc.get('row', 0)) + 1}・列 {loc.get('column', 0) + 1}"
         return f"短い語「{show(s.get('term'))}」が {where} に残っています"
+    if item.kind in (ReviewKind.FREETEXT_SHORT, ReviewKind.FREETEXT_AMBIGUOUS):
+        cands = "、".join(f"{c['masked_name']}（{c['label']}）" for c in s.get("candidates", []))
+        return f"「{show(s.get('term'))}」〔{s.get('scope')}〕置換先の候補：{cands}　例：{show(s.get('context'))}"
+    if item.kind is ReviewKind.FREETEXT_CANDIDATE:
+        pattern = CANDIDATE_PATTERNS.get(s.get("pattern"), "")
+        return f"{pattern}「{show(s.get('text'))}」〔{s.get('scope')}〕　例：{show(s.get('context'))}"
     return ""
 
 
@@ -70,6 +77,11 @@ class ReviewPage(QWidget):
         self.show_decided.currentIndexChanged.connect(self.refresh)
 
         self.candidate = QComboBox()
+        self.candidate_label = QLabel("紐付ける既存の対象")
+        # 文章内の候補の登録：登録する語句（検出した語句の一部に絞れる）と種類
+        self.term_edit = QLineEdit()
+        self.kind_combo = QComboBox()
+        self.kind_combo.currentIndexChanged.connect(self._kind_changed)
         self.buttons: dict[Decision, QPushButton] = {}
         actions = QHBoxLayout()
         for decision in Decision:
@@ -82,10 +94,21 @@ class ReviewPage(QWidget):
         actions.addWidget(self.forget)
         bulk = QPushButton("新しい対象をすべて登録")
         bulk.clicked.connect(self._register_all)
+        bulk_values = QPushButton("検出した電話番号・メール等をすべて置換")
+        bulk_values.setToolTip("規則で検出した電話番号・メール・郵便番号・URL を、値として登録して置換します")
+        bulk_values.clicked.connect(self._register_values)
         actions.addStretch()
+        actions.addWidget(bulk_values)
         actions.addWidget(bulk)
+        self.term_row = QWidget()
+        tr = QHBoxLayout(self.term_row)
+        tr.setContentsMargins(0, 0, 0, 0)
+        tr.addWidget(QLabel("登録する語句"))
+        tr.addWidget(self.term_edit, 1)
+        tr.addWidget(QLabel("種類"))
+        tr.addWidget(self.kind_combo)
         cand_row = QHBoxLayout()
-        cand_row.addWidget(QLabel("紐付ける既存の対象"))
+        cand_row.addWidget(self.candidate_label)
         cand_row.addWidget(self.candidate, 1)
 
         # 比較表示
@@ -103,7 +126,8 @@ class ReviewPage(QWidget):
         self.after.setModel(self.after_model)
         self.before.verticalScrollBar().valueChanged.connect(self.after.verticalScrollBar().setValue)
         self.after.verticalScrollBar().valueChanged.connect(self.before.verticalScrollBar().setValue)
-        note = QLabel("変換後の番号は確保済みのもので、出力でも同じになります。黄＝置換、赤＝内容を消す。")
+        note = QLabel("変換後の番号は確保済みのもので、出力でも同じになります。"
+                      "黄＝置換（文章内の語句の置換を含む）、赤＝内容を消す。")
         compare_head = QHBoxLayout()
         compare_head.addWidget(QLabel("表"))
         compare_head.addWidget(self.unit, 1)
@@ -124,6 +148,7 @@ class ReviewPage(QWidget):
         head.addWidget(self.show_decided)
         lu.addLayout(head)
         lu.addWidget(self.list)
+        lu.addWidget(self.term_row)
         lu.addLayout(cand_row)
         lu.addLayout(actions)
         lower = QWidget()
@@ -188,6 +213,31 @@ class ReviewPage(QWidget):
         i = self.list.currentRow()
         return self.items[i] if 0 <= i < len(self.items) else None
 
+    def _entity_types(self) -> list[tuple[str, str]]:
+        if not self.session:
+            return []
+        return [tuple(r) for r in self.session.project.conn.execute(
+            "SELECT id, display_name FROM entity_type ORDER BY rowid")]
+
+    def _kind_changed(self) -> None:
+        """候補の種類を変えたら、紐付け先（既存の対象）の一覧と押せる判断を変える。"""
+        item = self._current()
+        if item is None or item.kind is not ReviewKind.FREETEXT_CANDIDATE:
+            return
+        kind = self.kind_combo.currentData()
+        is_value = kind in VALUE_TYPES
+        open_ = item.state == "open"
+        self.buttons[Decision.REGISTER_NEW].setVisible(open_ and not is_value)
+        self.buttons[Decision.LINK_EXISTING].setVisible(open_ and not is_value)
+        self.buttons[Decision.REGISTER_VALUE].setVisible(open_ and is_value)
+        self.candidate.clear()
+        if not is_value and self.session:
+            for eid, masked in self.session.project.conn.execute(
+                "SELECT id, masked_name FROM entity WHERE entity_type_id = ? AND status IN ('draft', 'confirmed') "
+                "ORDER BY name_seq", (kind,)
+            ):
+                self.candidate.addItem(masked, eid)
+
     def _item_selected(self) -> None:
         item = self._current()
         allowed = ALLOWED[item.kind] if item and item.state == "open" else set()
@@ -195,10 +245,33 @@ class ReviewPage(QWidget):
             b.setVisible(decision in allowed)
         self.forget.setVisible(bool(item and item.decision and item.decision.get("remembered")))
         self.candidate.clear()
+        is_candidate = item is not None and item.kind is ReviewKind.FREETEXT_CANDIDATE
+        self.term_row.setVisible(is_candidate)
+        self.candidate_label.setText(
+            "置換先" if item is not None and item.kind in (ReviewKind.FREETEXT_SHORT, ReviewKind.FREETEXT_AMBIGUOUS)
+            else "紐付ける既存の対象")
         if item is None:
             return
+        if is_candidate:
+            s = item.subject
+            self.term_edit.setText(MASK.show(s.get("text", "")))
+            self.term_edit.setEnabled(not MASK.masked)
+            self.kind_combo.blockSignals(True)
+            self.kind_combo.clear()
+            for key, label in self._entity_types():
+                self.kind_combo.addItem(label, key)
+            for key, label in VALUE_TYPES.items():
+                self.kind_combo.addItem(label, key)
+            suggested = s.get("info_type") or s.get("entity_type")
+            self.kind_combo.setCurrentIndex(max(0, self.kind_combo.findData(suggested)))
+            self.kind_combo.blockSignals(False)
+            self._kind_changed()
+            return
         for c in item.subject.get("candidates", []):
-            self.candidate.addItem(c["masked_name"], c["entity_id"])
+            if "key" in c:
+                self.candidate.addItem(f"{c['masked_name']}（{c['label']}）", c["key"])
+            else:
+                self.candidate.addItem(c["masked_name"], c["entity_id"])
         if item.kind is ReviewKind.NEW_ENTITY and self.session:
             for eid, masked in self.session.project.conn.execute(
                 "SELECT id, masked_name FROM entity WHERE entity_type_id = ? AND status = 'confirmed' "
@@ -213,8 +286,25 @@ class ReviewPage(QWidget):
         entity_id = self.candidate.currentData() if decision is Decision.LINK_EXISTING else None
         if decision is Decision.LINK_EXISTING and not entity_id:
             return
-        run_safely(self, self.session.wb.decide, item.id, decision, entity_id)
+        options = {}
+        if decision is Decision.REPLACE_TERM:
+            options["target"] = self.candidate.currentData()
+        if item.kind is ReviewKind.FREETEXT_CANDIDATE:
+            kind = self.kind_combo.currentData()
+            if decision is Decision.REGISTER_NEW:
+                options["entity_type"] = kind
+            elif decision is Decision.REGISTER_VALUE:
+                options["info_type"] = kind
+            if not MASK.masked:
+                options["text"] = self.term_edit.text()
+        run_safely(self, self.session.wb.decide, item.id, decision, entity_id, **options)
         self._replan()
+
+    def _register_values(self) -> None:
+        if self.session and self.session.run_id:
+            run_safely(self, self.session.wb.decide_all, self.session.run_id, ReviewKind.FREETEXT_CANDIDATE,
+                       Decision.REGISTER_VALUE)
+            self._replan()
 
     def _forget(self) -> None:
         item = self._current()

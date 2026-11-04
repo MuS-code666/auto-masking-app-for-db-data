@@ -215,7 +215,6 @@ def test_s15_formulas(tmp_path, dataset):
     ("hidden_sheet", "residual", {"sheet": 1, "row": 1, "column": 0}),
     ("sheet_name", "residual_sheet_name", {"sheet": 1}),
     ("defined_name", "residual", {"part": "xl/workbook.xml"}),
-    ("header_footer", "residual", {"part": "xl/worksheets/sheet1.xml"}),
     ("validation_list", "residual", {"part": "xl/worksheets/sheet1.xml"}),
 ])
 def test_s9_residual_risks_are_blocked(tmp_path, dataset, risk, kind, location):
@@ -228,6 +227,21 @@ def test_s9_residual_risks_are_blocked(tmp_path, dataset, risk, kind, location):
             assert any(location.items() <= h.location.items() for h in hits)
         if risk == "hidden_sheet":
             assert report.by_kind("hidden_sheet")
+
+
+def test_s9_header_footer_is_replaced(tmp_path, dataset):
+    """ヘッダー・フッターの元の名称は、文章内の語句と同じ規則で置換する（段階4）。"""
+    project, wb, run, _, report, staged = _run_book(tmp_path, risk_book(dataset, "header_footer"))
+    with project:
+        assert report.ok, report.blocking
+        assert report.by_kind("part_text_replaced")
+        with zipfile.ZipFile(staged[0]) as zf:
+            sheet = zf.read("xl/worksheets/sheet1.xml").decode()
+        masked = project.conn.execute(
+            "SELECT e.masked_name FROM entity e JOIN entity_name n ON n.entity_id = e.id WHERE n.original_name = ?",
+            (customers(dataset)[0][1],)).fetchone()[0]
+        assert f"&amp;L{masked}様向け資料" in sheet
+        assert customers(dataset)[0][1] not in _all_text(staged[0])
 
 
 def test_s9_comments_can_be_removed(tmp_path, dataset):
@@ -307,11 +321,17 @@ def test_s10_comments_stop_until_removed(tmp_path, dataset):
         assert report.ok
 
 
-def test_s10_chart_cache_blocks_until_chart_removed(tmp_path, dataset):
-    project, wb, run, file_id, report, _ = _run_book(tmp_path, feature_book(dataset, "chart"))
+def test_s10_chart_cache_is_replaced_or_chart_removed(tmp_path, dataset):
+    """グラフのキャッシュ（項目名）は文章内の語句と同じ規則で置換する。同名の別顧客は置換先を選ぶ（段階4）。"""
+    project, wb, run, file_id, report, staged = _run_book(tmp_path, feature_book(dataset, "chart"))
     with project:
-        residual = [f for f in report.by_kind("residual") if "charts/" in f.location.get("part", "")]
-        assert residual and not report.ok
+        assert report.ok, report.blocking
+        assert report.by_kind("part_text_replaced")
+        decided = [i for i in wb.reviews(run, state=None) if i.kind.value == "freetext_ambiguous"]
+        assert decided and decided[0].subject["term"] == DUP_CUSTOMER_NAME
+        text = _all_text(staged[0])
+        for _, n in customers(dataset)[:5]:
+            assert n not in text
         wb.set_options(run, file_id, BookOptions(remove_charts=True))
         report, staged = run_through(wb, run)
         assert report.ok, report.blocking

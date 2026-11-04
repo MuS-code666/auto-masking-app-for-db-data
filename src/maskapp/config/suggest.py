@@ -14,6 +14,7 @@ from maskapp.config.model import (
     Action,
     ColumnSpec,
     Config,
+    OutsideAction,
     RelationSpec,
     Role,
     TemplateSpec,
@@ -34,7 +35,8 @@ CODE_SCHEMES = {
 }
 _CODE_WORDS = ("コード", "cd", "番号", "no", "id", "code", "№")
 _NAME_WORDS = ("名称", "氏名", "名", "name")
-_CLEAR_WORDS = ("備考", "メモ", "コメント", "摘要", "特記", "カナ", "フリガナ", "ふりがな", "住所", "所在地", "内線")
+_FREETEXT_WORDS = ("備考", "メモ", "コメント", "摘要", "特記", "連絡事項", "申し送り")
+_CLEAR_WORDS = ("カナ", "フリガナ", "ふりがな", "住所", "所在地", "内線")
 _VALUE_WORDS = [("EMAIL", ("メール", "mail", "e-mail")), ("PHONE", ("電話", "tel", "fax", "携帯")),
                 ("POSTAL", ("郵便", "〒"))]
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -70,8 +72,11 @@ def _value_type(header: str, samples: Sequence[str]) -> str | None:
 def suggest_column(header: str, samples: Sequence[str] = ()) -> ColumnSpec:
     """1列の設定の候補（結合の組は suggest_columns で決める）。"""
     h = _norm(header)
-    if any(w.casefold() in h for w in _CLEAR_WORDS) and not h.endswith(("コード", "cd")):
-        return ColumnSpec(header, Action.CLEAR)
+    if not h.endswith(("コード", "cd")):
+        if any(w.casefold() in h for w in _FREETEXT_WORDS):
+            return ColumnSpec(header, Action.FREETEXT)
+        if any(w.casefold() in h for w in _CLEAR_WORDS):
+            return ColumnSpec(header, Action.CLEAR)
     info_type = _value_type(header, samples)
     if info_type:
         return ColumnSpec(header, Action.REPLACE, info_type=info_type, role=Role.VALUE)
@@ -125,7 +130,8 @@ def suggest_template(name: str, rows: list[list[str]], header_row: int = 0) -> T
             seen[header] = 1
         fixed.append(c if header == c.header else ColumnSpec(header, c.action, c.info_type, c.entity_type, c.role,
                                                                c.code_scheme, c.binding))
-    return TemplateSpec(name, fixed, header_row)
+    # 表外（タイトル・注記・合計行）は既定で「文章内の語句を置換」（設計書 06 章 3）
+    return TemplateSpec(name, fixed, header_row, outside_action=OutsideAction.FREETEXT)
 
 
 # ---------------------------------------------------------------- 既存の表の定義との差分

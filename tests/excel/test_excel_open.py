@@ -81,6 +81,8 @@ def outputs(tmp_path_factory, dataset, dataset_dir) -> list[tuple[Path, set]]:
         ("rich", risk_book(dataset, "rich_text"), None),
         ("properties", risk_book(dataset, "properties"), None),
         ("chart", feature_book(dataset, "chart"), BookOptions(remove_charts=True)),
+        ("chart_replaced", feature_book(dataset, "chart"), None),  # グラフの文字を置換（段階4）
+        ("header_footer", risk_book(dataset, "header_footer"), None),  # ヘッダーの文字を置換（段階4）
         ("image", feature_book(dataset, "image"), BookOptions(accept_images=True)),
     ]
     for label, spec, options in cases:
