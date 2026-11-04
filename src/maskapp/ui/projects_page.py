@@ -129,7 +129,7 @@ class ProjectsPage(QWidget):
             for j, v in enumerate(values):
                 item = QTableWidgetItem(v)
                 if j == 1 and s.color:
-                    item.setBackground(QColor(s.color))
+                    item.setBackground(QColor(s.color))  # 色見本（文字なし）
                 self.table.setItem(i, j, item)
             self.table.item(i, 0).setData(256, str(s.path))  # UserRole
 

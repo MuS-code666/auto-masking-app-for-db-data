@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Signal
-from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -24,10 +23,8 @@ from PySide6.QtWidgets import (
 from maskapp.app.session import Session
 from maskapp.config import Action, ColumnSpec, RelationSpec, Role
 from maskapp.config.suggest import CODE_SCHEMES
-from maskapp.ui.common import MASK, run_safely
+from maskapp.ui.common import MASK, UNCONFIRMED_BG, highlight, run_safely
 from maskapp.ui.labels import ACTIONS, ROLES, VALUE_TYPES
-
-UNCONFIRMED = QColor("#fff2b3")
 
 
 def describe(spec: ColumnSpec, entity_names: dict[str, str]) -> tuple[str, str, str]:
@@ -263,7 +260,7 @@ class ConfigPage(QWidget):
             for j, v in enumerate(values):
                 item = QTableWidgetItem(v)
                 if not done:
-                    item.setBackground(UNCONFIRMED)
+                    highlight(item, UNCONFIRMED_BG)
                 self.columns.setItem(i, j, item)
 
     def _column_selected(self) -> None:

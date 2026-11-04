@@ -19,6 +19,15 @@ HEADER_BG = QColor("#dbe8ff")
 OUTSIDE_BG = QColor("#eeeeee")
 CHANGED_BG = QColor("#fff2b3")
 CLEARED_BG = QColor("#f6d6d6")
+UNCONFIRMED_BG = QColor("#ffd59e")
+# 色付きの背景には常に濃い文字色を使う（Windows のダーク モードでは既定の文字色が白になり読めないため）
+HIGHLIGHT_FG = QColor("#1a1a1a")
+
+
+def highlight(item, color: QColor) -> None:
+    """表の項目に背景色と、それに合う濃い文字色を設定する。"""
+    item.setBackground(color)
+    item.setForeground(HIGHLIGHT_FG)
 
 
 class MaskState(QObject):
@@ -94,6 +103,8 @@ class GridModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.BackgroundRole:
             color = self._background(r, c)
             return QBrush(color) if color else None
+        if role == Qt.ItemDataRole.ForegroundRole:
+            return QBrush(HIGHLIGHT_FG) if self._background(r, c) else None
         return None
 
     def headerData(self, section: int, orientation, role=Qt.ItemDataRole.DisplayRole):  # noqa: N802
